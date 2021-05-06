@@ -1,0 +1,79 @@
+use std::{error, fmt};
+
+use backtrace::Backtrace;
+
+#[derive(Debug)]
+pub struct TriangulationInternalError {
+    pub msg: String,
+    pub backtrace: Backtrace,
+}
+
+impl TriangulationInternalError {
+    #[inline(always)]
+    pub(crate) fn new(msg: impl Into<String>) -> Self {
+        Self {
+            msg: msg.into(),
+            backtrace: Backtrace::new_unresolved(),
+        }
+    }
+}
+
+impl fmt::Display for TriangulationInternalError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.msg.as_str())
+    }
+}
+
+impl error::Error for TriangulationInternalError { }
+
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum TriangulationError<FBError: error::Error> {
+    NoVertices,
+    NotEnoughVertices(usize),
+    InternalError(TriangulationInternalError),
+    FanBuilder(FBError),
+    #[cfg(feature = "debugging")]
+    SvgOutput(std::io::Error),
+}
+
+impl<FBError: error::Error> TriangulationError<FBError> {
+    #[inline(always)]
+    pub(crate) fn internal(msg: impl Into<String>) -> Self {
+        TriangulationError::InternalError(TriangulationInternalError {
+            msg: msg.into(),
+            backtrace: Backtrace::new_unresolved(),
+        })
+    }
+}
+
+impl<FBError: error::Error> From<FBError> for TriangulationError<FBError> {
+    fn from(e: FBError) -> Self {
+        Self::FanBuilder(e)
+    }
+}
+
+impl<FBError: error::Error> fmt::Display for TriangulationError<FBError> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoVertices => write!(f, "Polygon set contains no vertices"),
+            Self::NotEnoughVertices(vertices) => write!(f, "Polygon only contains {} vertices", vertices),
+            Self::InternalError(TriangulationInternalError { msg, backtrace }) => write!(f, "{}\n{:?}", msg, backtrace),
+            Self::FanBuilder(error) => (error as &dyn fmt::Display).fmt(f),
+            #[cfg(feature = "debugging")]
+            Self::SvgOutput(error) => (error as &dyn fmt::Display).fmt(f),
+        }
+    }
+}
+
+impl<FBError: error::Error> std::error::Error for TriangulationError<FBError> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InternalError(error) => Some(error),
+            Self::FanBuilder(error) => error.source(), // This should be Some(error), but that forces restricting FBError to 'static.
+            #[cfg(feature = "debugging")]
+            Self::SvgOutput(error) => Some(error),
+            _ => None,
+        }
+    }
+}

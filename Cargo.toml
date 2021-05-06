@@ -1,0 +1,42 @@
+[package]
+name = "triangulate"
+version = "0.1.0"
+authors = ["Colin Neville <colinjneville@gmail.com>"]
+edition = "2018"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+categories = ["algorithms", "game-development", "graphics", "mathematics", "rendering"]
+keywords = ["graphics", "geometry", "gamedev", "algorithm", "2d", "library"]
+repository = "https://github.com/colinjneville/triangulate/"
+description = "Subdivides polygons into equivalent triangles"
+
+exclude = [
+    "resources/*",
+]
+
+[dependencies]
+rand = "0.8.3"
+num-traits = "0.2.14"
+ordered-float = "2.2.0"
+smallvec = "1.6.1"
+backtrace = "0.3.58"
+zot = "0.1"
+text_trees = { version = "0.1.2", optional = true }
+svg_fmt = { version = "0.4.1", optional = true }
+
+[dev-dependencies]
+criterion = "0.3"
+
+[features]
+
+default = []
+debugging = [ "text_trees", "svg_fmt" ]
+benchmarking = []
+
+[profile.release] 
+debug = true
+
+[[bench]]
+name = "standard"
+harness = false
+required-features = [ "benchmarking" ]

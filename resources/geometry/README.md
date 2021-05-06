@@ -1,0 +1,1 @@
+Country geometry is derived from [natural-earth-geojson](https://github.com/martynafford/natural-earth-geojson), a GeoJSON conversion of [NaturalEarth](https://www.naturalearthdata.com/)'s public domain map dataset.
