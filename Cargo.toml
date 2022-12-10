@@ -1,12 +1,12 @@
 [package]
 name = "triangulate"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Colin Neville <colinjneville@gmail.com>"]
-edition = "2018"
+edition = "2021"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 categories = ["algorithms", "game-development", "graphics", "mathematics", "rendering"]
-keywords = ["graphics", "geometry", "gamedev", "algorithm", "2d"]
+keywords = ["triangulation", "geometry", "gamedev", "algorithm", "2d"]
 repository = "https://github.com/colinjneville/triangulate/"
 description = "Subdivides polygons into equivalent triangles"
 
@@ -21,22 +21,28 @@ ordered-float = "2.2.0"
 smallvec = "1.6.1"
 backtrace = "0.3.58"
 zot = "0.1"
+
+# _debugging
 text_trees = { version = "0.1.2", optional = true }
 svg_fmt = { version = "0.4.1", optional = true }
 
+# _benchmarking
+earcutr = { version = "0.3.0", optional = true }
+
 [dev-dependencies]
-criterion = "0.3"
+criterion = "0.4"
 
 [features]
 
 default = []
-debugging = [ "text_trees", "svg_fmt" ]
-benchmarking = []
+_debugging = ["dep:text_trees", "dep:svg_fmt"]
+_benchmarking = ["dep:earcutr"]
 
-[profile.release] 
+[profile.release-symbols]
+inherits = "release"
 debug = true
 
 [[bench]]
 name = "standard"
 harness = false
-required-features = [ "benchmarking" ]
+required-features = [ "_benchmarking" ]

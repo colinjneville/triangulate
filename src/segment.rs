@@ -1,9 +1,19 @@
-use crate::{PolygonList, PolygonListExt, Vertex, VertexIndex, idx::{Idx, IdxDisplay}, math::is_left_of_line, nexus::Nexus};
+use std::fmt;
 
-#[derive(Debug, Clone)]
+use crate::{Vertex, VertexIndex, idx::{Idx, IdxDisplay}, math::is_left_of_line, nexus::Nexus, Coords};
+
+#[derive(Clone)]
 pub(crate) struct Segment<V: Vertex, Index: VertexIndex> {
-    ni_max: Idx<Nexus<V, Index>>,
     ni_min: Idx<Nexus<V, Index>>,
+    ni_max: Idx<Nexus<V, Index>>,
+    c_min: Coords<V::Coordinate>,
+    c_max: Coords<V::Coordinate>,
+}
+
+impl<V: Vertex, Index: VertexIndex> fmt::Debug for Segment<V, Index> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Segment").field("ni_min", &self.ni_min).field("ni_max", &self.ni_max).field("c_min", &self.c_min).field("c_max", &self.c_max).finish()
+    }
 }
 
 impl<V: Vertex, Index: VertexIndex> IdxDisplay for Segment<V, Index> {
@@ -20,22 +30,19 @@ where V::Coordinate: std::fmt::Display {
 }
 
 impl<V: Vertex, Index: VertexIndex> Segment<V, Index> {
-    pub fn new(ni_min: Idx<Nexus<V, Index>>, ni_max: Idx<Nexus<V, Index>>) -> Self {
+    pub fn new(ni_min: Idx<Nexus<V, Index>>, ni_max: Idx<Nexus<V, Index>>, c_min: Coords<V::Coordinate>, c_max: Coords<V::Coordinate>) -> Self {
         Self {
             ni_min,
             ni_max,
+            c_min,
+            c_max,
         }
     }
 
     pub fn ni_min(&self) -> Idx<Nexus<V, Index>> { self.ni_min }
     pub fn ni_max(&self) -> Idx<Nexus<V, Index>> { self.ni_max }
 
-    pub fn is_on_left<'a, P: PolygonList<'a, Index=Index>>(&self, ps: PolygonListExt<'a, P>, ns: &[Nexus<V, Index>], vi: Index) -> bool {
-        let n_min = &ns[self.ni_min];
-        let n_max = &ns[self.ni_max];
-        let v_min = &ps[n_min.vertex()];
-        let v_max = &ps[n_max.vertex()];
-        let v = &ps[vi];
-        is_left_of_line(v_min, v_max, v)
+    pub fn is_on_left(&self, c: Coords<V::Coordinate>) -> bool {
+        is_left_of_line(self.c_min, self.c_max, c)
     }
 }

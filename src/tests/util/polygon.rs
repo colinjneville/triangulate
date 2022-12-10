@@ -1,33 +1,42 @@
-use super::vtest::VTest;
+//! Sample polygons
 
-pub fn square() -> Vec<VTest> {
+/// A square polygon
+pub fn square() -> Vec<[f32; 2]> {
     vec![
-        (0.0, 0.0).into(),
-        (0.0, 1.0).into(),
-        (1.0, 1.0).into(),
-        (1.0, 0.0).into(),
+        [0.0, 0.0],
+        [0.0, 1.0],
+        [1.0, 1.0],
+        [1.0, 0.0],
     ]
 }
 
-pub fn star() -> Vec<VTest> {
+/// A 4-pointed star polygon
+pub fn star() -> Vec<[f32; 2]> {
     vec![
-        (1.0, 0.0).into(),
-        (2.0, 2.0).into(),
-        (0.0, 1.0).into(),
-        (-2.0, 2.0).into(),
-        (-1.0, 0.0).into(),
-        (-2.0, -2.0).into(),
-        (0.0, -1.0).into(),
-        (2.0, -2.0).into(),
+        [1.0, 0.0],
+        [2.0, 2.0],
+        [0.0, 1.0],
+        [-2.0, 2.0],
+        [-1.0, 0.0],
+        [-2.0, -2.0],
+        [0.0, -1.0],
+        [2.0, -2.0],
     ]
 }
 
-pub fn half_frame() -> Vec<VTest> {
+/// A concave half frame polygon
+pub fn half_frame() -> Vec<[f32; 2]> {
     vec![
-        (0., 0.).into(), (0.05, 0.05).into(), (0.95, 0.05).into(), (0.95, 0.95).into(), (1., 1.).into(), (1., 0.).into()
+        [0., 0.], 
+        [0.05, 0.05], 
+        [0.95, 0.05],
+        [0.95, 0.95],
+        [1., 1.],
+        [1., 0.],
     ]
 }
 
-pub fn all() -> Vec<Vec<VTest>> {
+/// All polygons in this module
+pub fn all() -> Vec<Vec<[f32; 2]>> {
     vec![square(), star(), half_frame()]
 }

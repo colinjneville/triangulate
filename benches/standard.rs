@@ -1,33 +1,38 @@
-use std::fs;
+use std::hint;
 
-use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
-use triangulate::builders;
+use criterion::{Criterion, criterion_group, criterion_main};
+use triangulate::ListFormat;
+use triangulate::formats;
 use triangulate::tests::util;
-use triangulate::TriangulateDefault;
+use triangulate::PolygonList;
 
+// cargo bench --profile=release-symbols -F "_benchmarking"
 pub fn criterion_benchmark(c: &mut Criterion) {
-    // let mut group = c.benchmark_group("geography");
+    let polygon_list = util::load_polygon_list(util::countries_path().join("russia.txt").to_str().unwrap()).unwrap();
+    let polygon_list = polygon_list.index_with::<usize, u16>();
 
-    // for file in fs::read_dir(util::countries_path()).unwrap() {
-    //     let file = file.unwrap();
-        
-    //     let polygon_set = util::load_polygon_set(file.path().to_str().unwrap());
+    c.bench_function("russia", |b| b.iter(|| {
+        let mut output = Vec::<[_; 3]>::new();
+        let builder = formats::IndexedListFormat::new(&mut output).into_fan_format();
+        polygon_list.triangulate(builder).expect("Triangulation failed");
 
-    //     polygon_set.triangulate_default::<def::VecVecFanBuilder<_>>().expect("Triangulation failed");
-        
-    //     group.throughput(Throughput::Elements(polygon_set.iter().map(|p| p.len() as u64).sum()));
-    //     group.bench_with_input(file.file_name().to_string_lossy(), &polygon_set, |b, ps| {
-    //         b.iter(|| ps.triangulate_default::<def::VecVecFanBuilder<_>>().expect("Triangulation failed"))
-    //     });
-    // }
-
-    // group.finish();
-
-    c.bench_function("brazil", |b| b.iter(|| {
-        let polygon_set = util::load_polygon_list(util::countries_path().join("brazil.txt").to_str().unwrap());
-        polygon_set.triangulate_default::<builders::VecVecIndexedFanBuilder<_>>().expect("Triangulation failed");
+        hint::black_box(output);
     }));
 }
 
-criterion_group!(benches, criterion_benchmark);
+pub fn criterion_benchmark_earcutr(c: &mut Criterion) {
+    use triangulate::Vertex;
+
+    let polygon_list = util::load_polygon_list(util::countries_path().join("russia.txt").to_str().unwrap()).unwrap();
+    let polygon_list: Vec<Vec<f32>> = polygon_list.into_iter().map(|p| p.iter().flat_map(|v| [v.x(), v.y()].into_iter()).collect()).collect();
+
+    c.bench_function("russia_earcutr", |b| b.iter(|| {
+        for polygon in polygon_list.iter() {
+            let triangles = earcutr::earcut(polygon, &[], 2);
+            hint::black_box(triangles);
+        }
+    }));
+}
+
+criterion_group!(benches, criterion_benchmark, criterion_benchmark_earcutr);
 criterion_main!(benches);

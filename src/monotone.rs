@@ -1,46 +1,43 @@
 use std::marker::PhantomData;
 
+use num_traits::real::Real;
 use smallvec::{SmallVec, smallvec};
 
-use crate::{FanBuilder, FanBuilderState, PolygonList, PolygonListExt, TriangleWinding, VertexIndex, errors::{TriangulationError, TriangulationInternalError}, math::is_left_of_line};
+use crate::{FanFormat, FanBuilderState, PolygonList, PolygonListExt, TriangleWinding, VertexIndex, errors::{TriangulationError, InternalError}, math::is_left_of_line, FanBuilder, Coords};
 
-pub(crate) struct MonotoneBuilder<Index: VertexIndex> {
-    vec: SmallVec<[Index; 8]>,
+pub(crate) struct MonotoneBuilder<Index: VertexIndex, C: Real> {
+    vec: SmallVec<[(Index, Coords<C>); 16]>,
     diff_x: bool,
     diff_y: bool,
 }
 
-impl<Index: VertexIndex> MonotoneBuilder<Index> {
-    pub fn new(vi: Index) -> Self {
+impl<Index: VertexIndex, C: Real> MonotoneBuilder<Index, C> {
+    pub fn new(vi: Index, c: Coords<C>) -> Self {
         Self {
-            vec: smallvec![vi],
+            vec: smallvec![(vi, c)],
             diff_x: false,
             diff_y: false,
         }
     }
 
-    pub fn add_vertex<'a, P: PolygonList<'a, Index=Index>>(&mut self, ps: PolygonListExt<'a, P>, vi: Index) {
-        if !self.diff_x {
-            if ps[vi.clone()].x() != ps[self.vec[0].clone()].x() {
-                self.diff_x = true;
-            }
+    pub fn add_vertex(&mut self, vi: Index, c: Coords<C>) {
+        if !self.diff_x && c.x() != self.vec[0].1.x() {
+            self.diff_x = true;
         }
-        if !self.diff_y {
-            if ps[vi.clone()].y() != ps[self.vec[0].clone()].y() {
-                self.diff_y = true;
-            }
+        if !self.diff_y && c.y() != self.vec[0].1.y() {
+            self.diff_y = true;
         }
 
-        self.vec.push(vi);
+        self.vec.push((vi, c));
     }
 
-    pub fn build<'a, P: PolygonList<'a, Index=Index>>(self, ps: PolygonListExt<'a, P>) -> Result<Option<Monotone<Index>>, TriangulationInternalError> {
+    pub fn build(self) -> Result<Option<Monotone<Index, C>>, InternalError> {
         if self.vec.len() < 3 {
-            return Err(TriangulationInternalError::new(format!("Monotone needs at least 3 vertices, has {}", self.vec.len())));
+            return Err(InternalError::new(format!("Monotone needs at least 3 vertices, has {}", self.vec.len())));
         }
 
         if self.diff_x && self.diff_y {
-            let is_left_chain = is_left_of_line(&ps[self.vec[self.vec.len() - 1].clone()], &ps[self.vec[0].clone()], &ps[self.vec[1].clone()]);
+            let is_left_chain = is_left_of_line(self.vec[self.vec.len() - 1].1, self.vec[0].1, self.vec[1].1);
             Ok(Some(Monotone::new(self.vec, is_left_chain)))
         } else {
             Ok(None)
@@ -48,36 +45,37 @@ impl<Index: VertexIndex> MonotoneBuilder<Index> {
     }
 }
 
-pub struct Monotone<Index> {
-    // Skipped stack from [0, skipped_top), pending stack from [pending_top, len), expended values remain in [skipped_top, pending_top)
-    pub(crate) skipped_and_pending: SmallVec<[Index; 8]>,
+pub struct Monotone<Index: VertexIndex, C: Real> {
+    // Skipped stack from [0, skipped_top), pending stack from [pending_top, len), expended/deferred values remain in [skipped_top, pending_top)
+    pub(crate) skipped_and_pending: SmallVec<[(Index, Coords<C>); 16]>,
     skipped_top: usize,
     pending_top: usize,
     // Is the chain on the left of the polygon (and the single edge on the right)?
     is_left_chain: bool,
 }
 
-#[cfg(feature = "debugging")]
-impl<Index: VertexIndex> std::fmt::Display for Monotone<Index> {
+#[cfg(feature = "_debugging")]
+impl<Index: VertexIndex, C: Real> std::fmt::Display for Monotone<Index, C> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "is_left_chain: {}", self.is_left_chain)?;
         write!(f, "[ ")?;
         for i in 0..self.skipped_top {
-            write!(f, "{:03?} ", self.skipped_and_pending[i])?;
+            write!(f, "{:03?} ", self.skipped_and_pending[i].0)?;
         }
         write!(f, "] ")?;
         for i in self.skipped_top..self.pending_top {
-            write!(f, "{:03?} ", self.skipped_and_pending[i])?;
+            write!(f, "{:03?} ", self.skipped_and_pending[i].0)?;
         }
         write!(f, "[ ")?;
         for i in self.pending_top..self.skipped_and_pending.len() {
-            write!(f, "{:03?} ", self.skipped_and_pending[i])?;
+            write!(f, "{:03?} ", self.skipped_and_pending[i].0)?;
         }
         write!(f, "]")
     }
 }
 
-impl<Index: VertexIndex> Monotone<Index> {
-    fn new(vertices: SmallVec<[Index; 8]>, is_left_chain: bool) -> Self {
+impl<Index: VertexIndex, C: Real> Monotone<Index, C> {
+    fn new(vertices: SmallVec<[(Index, Coords<C>); 16]>, is_left_chain: bool) -> Self {
         Self {
             skipped_and_pending: vertices,
             skipped_top: 2,
@@ -86,13 +84,13 @@ impl<Index: VertexIndex> Monotone<Index> {
         }
     }
 
-    pub(crate) fn build_fans<'z, 'a, P: PolygonList<'a, Index=Index>, FB: FanBuilder<'a, P>>(mut self, ps: PolygonListExt<'a, P>, fbs: &'z mut FanBuilderState<'a, P, FB>) -> Result<(), TriangulationError<FB::Error>> {
-        enum BuilderOrDeferredTris<'z, 'a, P: PolygonList<'a>, FB: FanBuilder<'a, P>> {
-            Builder(&'z mut FB),
-            DeferredTris(&'z mut FanBuilderState<'a, P, FB>, usize, PhantomData<&'a ()>),
+    pub(crate) fn build_fans<'z, 'p, P: PolygonList<'p, Index=Index> + ?Sized, FB: FanFormat<'p, P>>(mut self, ps: PolygonListExt<'p, P>, fbs: &'z mut FanBuilderState<'p, P, FB>) -> Result<(), TriangulationError<<FB::Builder as FanBuilder<'p, P>>::Error>> {
+        enum BuilderOrDeferredTris<'z, 'p, P: PolygonList<'p> + ?Sized, FB: FanFormat<'p, P>> {
+            Builder(&'z mut FB::Builder),
+            DeferredTris(&'z mut FanBuilderState<'p, P, FB>, usize, PhantomData<&'p ()>),
         }
-        impl<'z, 'a, P: PolygonList<'a>, FB: FanBuilder<'a, P>> BuilderOrDeferredTris<'z, 'a, P, FB> {
-            fn add_triangle(&mut self, vi: P::Index) -> Result<(), FB::Error> {
+        impl<'z, 'p, P: PolygonList<'p> + ?Sized, FB: FanFormat<'p, P>> BuilderOrDeferredTris<'z, 'p, P, FB> {
+            fn add_triangle(&mut self, vi: P::Index) -> Result<(), <FB::Builder as FanBuilder<'p, P>>::Error> {
                 match self {
                     BuilderOrDeferredTris::Builder(fb) => fb.extend_fan(vi)?,
                     BuilderOrDeferredTris::DeferredTris(_, dt, _) => *dt += 1,
@@ -101,90 +99,105 @@ impl<Index: VertexIndex> Monotone<Index> {
             }
         }
 
-        while self.pending_top < self.skipped_and_pending.len() {
-            if self.can_triangulate(ps) {
-                let vi1 = self.skipped_pop();
-                let mut vi0 = self.skipped_peek();
-                let mut vi2 = self.pending_peek();
+        while self.remaining_vertices() >= 3 {
+            if self.can_triangulate() {
+                // The base triangle, with all 3 points specified
+                let vi1 = self.skipped_pop().0;
+                let mut vi0 = self.skipped_peek().0;
+                let mut vi2 = self.pending_peek().0;
 
                 // Advancing fan/backtracking fan and left chain/right chain both invert the winding.
                 // If we need to de-invert the winding, defer add_triangle calls until we have processed the fan 
                 // and can make the calls in a reversed order
-                let can_triangulate_next = self.can_triangulate(ps);
-                let mut bodt: BuilderOrDeferredTris<'_, '_, P, FB> = if can_triangulate_next ^ self.is_left_chain ^ (FB::WINDING == TriangleWinding::Clockwise) {
+                let is_backtracking = self.can_triangulate();
+                let mut bodt: BuilderOrDeferredTris<'_, '_, P, FB> = if is_backtracking ^ self.is_left_chain ^ (FB::Builder::WINDING == TriangleWinding::Clockwise) {
                     if !self.is_left_chain {
                         std::mem::swap(&mut vi0, &mut vi2);
                     }
-                    BuilderOrDeferredTris::Builder(fbs.new_fan(ps.0, vi0, vi1, vi2)?)
+                    BuilderOrDeferredTris::Builder(fbs.new_fan(ps.polygon_list(), vi0, vi1, vi2)?)
                 } else {
                     BuilderOrDeferredTris::DeferredTris(fbs, 1, PhantomData)
                 };
 
                 // If the next triangle comes from backtracking the stack, the active vertex is the fan root, 
                 // otherwise the penultimate stack vertex is the root
-                if can_triangulate_next {
+                if is_backtracking {
                     // We already confirmed we can extend at least one more triangle
                     self.skipped_pop();
-                    bodt.add_triangle(self.skipped_peek()).map_err(TriangulationError::from)?;
+                    bodt.add_triangle(self.skipped_peek().0).map_err(TriangulationError::from)?;
 
                     // Then continue adding triangles as much as possible
-                    while self.can_triangulate(ps) {
+                    while self.can_triangulate() {
                         self.skipped_pop();
-                        bodt.add_triangle(self.skipped_peek()).map_err(TriangulationError::from)?;
+                        bodt.add_triangle(self.skipped_peek().0).map_err(TriangulationError::from)?;
                     }
                 } else {
                     self.transfer_pending();
-                    while self.can_triangulate(ps) {
+                    while self.can_triangulate() {
                         self.skipped_pop();
-                        bodt.add_triangle(self.pending_peek()).map_err(TriangulationError::from)?;
+                        bodt.add_triangle(self.pending_peek().0).map_err(TriangulationError::from)?;
+
                         self.transfer_pending();
                     }
                 }
 
-                
+                // If we had to defer extend_fan calls, execute them now in reverse order
                 if let BuilderOrDeferredTris::DeferredTris(fbs, dt, _) = bodt {
-                    let (vi0, vi1, vi2) = if can_triangulate_next {
-                        (self.pending_peek(), self.skipped_peek(), self.deferred_index(0))
+                    let (vi0, vi1, vi2) = if is_backtracking {
+                        (self.pending_peek().0, self.skipped_peek().0, self.deferred_index(is_backtracking, 0))
                     } else {
-                        let (vi0, vi1) = self.skipped_peek2();
-                        (vi0, vi1, self.deferred_index(dt - 1))
+                        let ((vi0,  _), (vi1, _)) = self.skipped_peek2();
+                        (vi0, vi1, self.deferred_index(is_backtracking, 0))
                     };
-                    let fb = fbs.new_fan(ps.0, vi0, vi1, vi2)?;
+                    let fb = fbs.new_fan(ps.polygon_list(), vi0, vi1, vi2)?;
                     for i in 1..dt {
-                        let index = if can_triangulate_next {
-                            i
-                        } else {
-                            dt - i - 1
-                        };
-                        if let Err(e) = fb.extend_fan(self.deferred_index(index)) {
+                        if let Err(e) = fb.extend_fan(self.deferred_index(is_backtracking, i)) {
                             return Err(e.into());
                         }
                     }
                 }
             }
+
             if self.has_pending() {
                 self.transfer_pending();
+            } else {
+                // In rare cases, pushing vertices and popping whenever backtracking is possible will not be able to triangulate everything.
+                // If we have pushed all vertices and we can't backtrack, reset our position to the initial setup (minus all removed vertices)
+                self.reset_position();
             }
         }
-        
-        Ok(())
+
+        let remaining_vertices = self.skipped_and_pending.len() - self.pending_top + self.skipped_top;
+        if remaining_vertices == 2 {
+            Ok(())
+        } else {
+            Err(TriangulationError::internal(format!("Expected 2 remaining vertices, found {remaining_vertices}")))
+        }
     }
 
-    fn skipped_peek(&self) -> Index {
+    #[inline(always)]
+    fn skipped_peek(&self) -> (Index, Coords<C>) {
         self.skipped_and_pending[self.skipped_top - 1].clone()
     }
 
-    fn skipped_peek2(&self) -> (Index, Index) {
+    #[inline(always)]
+    fn skipped_peek2(&self) -> ((Index, Coords<C>), (Index, Coords<C>)) {
         (self.skipped_and_pending[self.skipped_top - 2].clone(), self.skipped_and_pending[self.skipped_top - 1].clone())
     }
 
-    fn skipped_pop(&mut self) -> Index {
+    #[inline(always)]
+    fn skipped_pop(&mut self) -> (Index, Coords<C>) {
         self.skipped_top -= 1;
         self.skipped_and_pending[self.skipped_top].clone()
     }
 
-    fn pending_peek(&self) -> Index {
+    #[inline(always)]
+    fn pending_peek(&self) -> (Index, Coords<C>) {
         self.skipped_and_pending[self.pending_top].clone()
+    }
+
+    fn remaining_vertices(&self) -> usize {
+        self.skipped_and_pending.len() - self.pending_top + self.skipped_top
     }
 
     fn transfer_pending(&mut self) {
@@ -195,18 +208,29 @@ impl<Index: VertexIndex> Monotone<Index> {
         self.pending_top += 1;
     }
 
-    fn has_pending(&self) -> bool { self.pending_top < self.skipped_and_pending.len() }
-
-    fn deferred_index(&self, i: usize) -> Index {
-        self.skipped_and_pending[self.skipped_top + i].clone()
+    fn reset_position(&mut self) {
+        self.skipped_and_pending.truncate(self.skipped_top);
+        self.skipped_top = 2;
+        self.pending_top = 2;
     }
 
-    fn can_triangulate<'a, P: PolygonList<'a, Index=Index>>(&self, ps: PolygonListExt<'a, P>) -> bool {
+    fn has_pending(&self) -> bool { self.pending_top < self.skipped_and_pending.len() }
+
+    fn deferred_index(&self, is_backtracking: bool, i: usize) -> Index {
+        let index = if is_backtracking {
+            self.skipped_top + i
+        } else {
+            self.pending_top - 1 - i
+        };
+        self.skipped_and_pending[index].0.clone()
+    }
+
+    fn can_triangulate(&self) -> bool {
         self.skipped_top >= 2 && self.has_pending() && {
-            let v_min = &ps[self.pending_peek()];
-            let (v_max, v) = { let (vi_max, vi) = self.skipped_peek2(); (&ps[vi_max], &ps[vi]) };
+            let c_min = self.pending_peek().1;
+            let ((_, c_max), (_, c)) = self.skipped_peek2();
             
-            self.is_left_chain == is_left_of_line(v_min, v_max, v)
+            self.is_left_chain == is_left_of_line(c_min, c_max, c)
         }
     }
 }

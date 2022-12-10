@@ -1,13 +1,14 @@
-use crate::{Vertex, VertexExt};
-use num_traits::Zero;
+use num_traits::real::Real;
 
-pub(crate) fn is_left_of_line<V: Vertex>(v_min: &VertexExt<V>, v_max: &VertexExt<V>, v: &VertexExt<V>) -> bool {
-    if v.y() == v_max.y() {
-        v.x() < v_max.x()
-    } else if v.y() == v_min.y() {
-        v.x() < v_min.x()
+use crate::Coords;
+
+pub(crate) fn is_left_of_line<C: Real>(c_min: Coords<C>, c_max: Coords<C>, c: Coords<C>) -> bool {
+    if c.y() == c_max.y() {
+        c.x() < c_max.x()
+    } else if c.y() == c_min.y() {
+        c.x() < c_min.x()
     } else {
-        v_max.cross(v_min, v) < V::Coordinate::zero()
+        (c_min.x() - c_max.x()) * (c.y() - c_max.y()) < (c_min.y() - c_max.y()) * (c.x() - c_max.x())
     }
 }
 

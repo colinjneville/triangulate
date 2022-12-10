@@ -1,8 +1,8 @@
-use std::marker::PhantomData;
+use std::{marker::PhantomData, mem, fmt};
 
 use zot::{Ot, Zot};
 
-use crate::{PolygonList, PolygonListExt, Vertex, VertexIndex, errors::TriangulationInternalError, idx::{Idx, IdxDisplay}, segment::Segment, trapezoid::Trapezoid};
+use crate::{Vertex, VertexIndex, errors::InternalError, idx::{Idx, IdxDisplay}, segment::Segment, trapezoid::Trapezoid, Coords, math::is_left_of_line};
 
 #[derive(Debug, Eq, PartialEq, Copy, Clone)]
 pub enum DividerDirection {
@@ -10,11 +10,16 @@ pub enum DividerDirection {
     Descending,
 }
 
-#[derive(Debug)]
 struct Divider<V: Vertex, Index: VertexIndex> {
     si: Idx<Segment<V, Index>>,
     ti_right: Idx<Trapezoid<V, Index>>,
     direction: DividerDirection,
+}
+
+impl<V: Vertex, Index: VertexIndex> fmt::Debug for Divider<V, Index> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Divider").field("si", &self.si).field("ti_right", &self.ti_right).field("direction", &self.direction).finish()
+    }
 }
 
 impl<V: Vertex, Index: VertexIndex> Divider<V, Index> {
@@ -39,13 +44,24 @@ pub(crate) enum FinalNexusType<V: Vertex, Index: VertexIndex> {
     A { _ti_up: Idx<Trapezoid<V, Index>>, ti_downleft: Idx<Trapezoid<V, Index>>, ti_downcenter: Idx<Trapezoid<V, Index>>, ti_downright: Idx<Trapezoid<V, Index>> },
 }
 
-#[derive(Debug)]
 pub(crate) struct Nexus<V: Vertex, Index: VertexIndex> {
     vi: Index,
+    c: Coords<V::Coordinate>,
     ti_upleft: Idx<Trapezoid<V, Index>>,
     ti_downleft: Idx<Trapezoid<V, Index>>,
     dividers: Zot<Divider<V, Index>>,
     _v: PhantomData<V>,
+}
+
+impl<V: Vertex, Index:VertexIndex> std::fmt::Debug for Nexus<V, Index> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut s = f.debug_struct("Nexus");
+        #[cfg(feature = "_debugging")]
+        s.field("vi", &self.vi);
+        #[cfg(not(feature = "_debugging"))]
+        s.field("vi", &"?");
+        s.field("c", &self.c).field("ti_upleft", &self.ti_upleft).field("ti_downleft", &self.ti_downleft).field("dividers", &self.dividers).field("_v", &self._v).finish()
+    }
 }
 
 impl<V: Vertex + std::fmt::Display, Index: VertexIndex + std::fmt::Display> std::fmt::Display for Nexus<V, Index> {
@@ -71,9 +87,10 @@ impl<V: Vertex, Index: VertexIndex> IdxDisplay for Nexus<V, Index> {
 }
 
 impl<V: Vertex, Index: VertexIndex> Nexus<V, Index> {
-    pub fn new(vi: Index, ti_up: Idx<Trapezoid<V, Index>>, ti_down: Idx<Trapezoid<V, Index>>) -> Self {
+    pub fn new(vi: Index, c: Coords<V::Coordinate>, ti_up: Idx<Trapezoid<V, Index>>, ti_down: Idx<Trapezoid<V, Index>>) -> Self {
         Self {
             vi,
+            c,
             ti_upleft: ti_up,
             ti_downleft: ti_down,
             dividers: Zot::Zero,
@@ -81,7 +98,7 @@ impl<V: Vertex, Index: VertexIndex> Nexus<V, Index> {
         }
     }
 
-    pub fn final_type(&self) -> Result<FinalNexusType<V, Index>, TriangulationInternalError> {
+    pub fn final_type(&self) -> Result<FinalNexusType<V, Index>, InternalError> {
         if let Zot::Two(div0, div1) = &self.dividers {
              Ok(
                  if div0.direction == DividerDirection::Descending {
@@ -108,14 +125,16 @@ impl<V: Vertex, Index: VertexIndex> Nexus<V, Index> {
                 }
             )
         } else {
-            Err(TriangulationInternalError::new("Nexus does not have two joined segments"))
+            Err(InternalError::new("Nexus does not have two joined segments"))
         }
     }
 
     pub fn vertex(&self) -> Index { self.vi.clone() }
 
-    pub fn replace_trapezoid(&mut self, ti_old: Idx<Trapezoid<V, Index>>, ti_new: Idx<Trapezoid<V, Index>>) -> Result<(), TriangulationInternalError> {
-        *self.find_trapezoid(ti_old).ok_or_else(|| TriangulationInternalError::new(format!("Trapezoid {} is not connected to replace with {}", ti_old, ti_new)))? = ti_new;
+    pub fn coords(&self) -> Coords<V::Coordinate> { self.c }
+
+    pub fn replace_trapezoid(&mut self, ti_old: Idx<Trapezoid<V, Index>>, ti_new: Idx<Trapezoid<V, Index>>) -> Result<(), InternalError> {
+        *self.find_trapezoid(ti_old).ok_or_else(|| InternalError::new(format!("Trapezoid {} is not connected to replace with {}", ti_old, ti_new)))? = ti_new;
         Ok(())
     }
 
@@ -134,7 +153,7 @@ impl<V: Vertex, Index: VertexIndex> Nexus<V, Index> {
         }
     }
 
-    pub fn add_segment<'a, P: PolygonList<'a, Vertex=V, Index=Index>>(ns: &mut [Nexus<V, Index>], ps: PolygonListExt<'a, P>, ss: &[Segment<V, Index>], ni: Idx<Nexus<V, Index>>, si: Idx<Segment<V, Index>>, ti_right: Idx<Trapezoid<V, Index>>) -> Result<(), TriangulationInternalError> {
+    pub fn add_segment(ns: &mut [Nexus<V, Index>], ss: &[Segment<V, Index>], ni: Idx<Nexus<V, Index>>, si: Idx<Segment<V, Index>>, ti_right: Idx<Trapezoid<V, Index>>) -> Result<(), InternalError> {
         let dir = Self::get_segment_direction(ss, ni, si)?;
         let div = Divider::new(si, ti_right, dir);
         let mut divs = Zot::Zero;
@@ -149,7 +168,7 @@ impl<V: Vertex, Index: VertexIndex> Nexus<V, Index> {
                         DividerDirection::Ascending => s1.ni_max(),
                         DividerDirection::Descending => s1.ni_min(),
                     };
-                    s0.is_on_left(ps, ns, ns[ni1].vertex())
+                    s0.is_on_left(ns[ni1].coords())
                 } else {
                     div.direction == DividerDirection::Ascending
                 };
@@ -159,19 +178,19 @@ impl<V: Vertex, Index: VertexIndex> Nexus<V, Index> {
                     Zot::Two(div0, div)
                 }
             },
-            Zot::Two(div0, div1) => return Err(TriangulationInternalError::new(format!("Nexus already has two segments ({}, {})", div0, div1))),
+            Zot::Two(div0, div1) => return Err(InternalError::new(format!("Nexus already has two segments ({}, {})", div0, div1))),
         };
         Ok(())
     }
 
-    fn get_segment_direction(ss: &[Segment<V, Index>], ni: Idx<Nexus<V, Index>>, si: Idx<Segment<V, Index>>) -> Result<DividerDirection, TriangulationInternalError> {
+    fn get_segment_direction(ss: &[Segment<V, Index>], ni: Idx<Nexus<V, Index>>, si: Idx<Segment<V, Index>>) -> Result<DividerDirection, InternalError> {
         let s = &ss[si];
         if ni == s.ni_max() {
             Ok(DividerDirection::Descending)
         } else if ni == s.ni_min() {
             Ok(DividerDirection::Ascending)
         } else {
-            Err(TriangulationInternalError::new(format!("{} does not contain {}", si, ni)))
+            Err(InternalError::new(format!("{} does not contain {}", si, ni)))
         }
     }
 
@@ -194,31 +213,78 @@ impl<V: Vertex, Index: VertexIndex> Nexus<V, Index> {
     }
 
     pub fn iter_up_trapezoids(&self) -> impl Iterator<Item=Idx<Trapezoid<V, Index>>> + '_ {
-        NexusTrapezoidIter::new(&self, DividerDirection::Ascending)
+        NexusTrapezoidIter::new(self, DividerDirection::Ascending)
     }
 
     pub fn iter_down_trapezoids(&self) -> impl Iterator<Item=Idx<Trapezoid<V, Index>>> + '_ {
-        NexusTrapezoidIter::new(&self, DividerDirection::Descending)
+        NexusTrapezoidIter::new(self, DividerDirection::Descending)
     }
 
-    pub fn get_down_trapezoid_in_direction<'a, P: PolygonList<'a, Vertex=V, Index=Index>>(&self, ps: PolygonListExt<'a, P>, ns: &[Nexus<V, Index>], ss: &[Segment<V, Index>], s: &Segment<V, Index>) -> Result<Idx<Trapezoid<V, Index>>, TriangulationInternalError> {
+    pub fn get_down_trapezoid_in_direction(&self, ns: &[Nexus<V, Index>], ss: &[Segment<V, Index>], s: &Segment<V, Index>) -> Result<Idx<Trapezoid<V, Index>>, InternalError> {
         match self.filter_dividers(DividerDirection::Descending) {
             Zot::Zero => Ok(self.ti_downleft),
             Zot::One(div_r) |
             Zot::Two(_, div_r) => {
-                let vi = if ns[s.ni_min()].vertex() == self.vertex() {
-                    return Err(TriangulationInternalError::new("Invalid segment/nexus connection"))
+                let c = if ns[s.ni_min()].vertex() == self.vertex() {
+                    return Err(InternalError::new("Invalid segment/nexus connection"))
                 } else if ns[s.ni_max()].vertex() == self.vertex() {
-                    ns[ss[div_r.si].ni_min()].vertex()
+                    ns[ss[div_r.si].ni_min()].coords()
                 } else {
-                    self.vertex()
+                    self.coords()
                 };
-                if s.is_on_left(ps, ns, vi) {
+                if s.is_on_left(c) {
                     Ok(div_r.ti_right)
                 } else {
                     Ok(self.ti_downleft)
                 }
             }
+        }
+    }
+
+    pub fn get_trapezoid_between_coords(&self, direction: DividerDirection, mut c_from: Coords<V::Coordinate>, mut c_to: Coords<V::Coordinate>) -> Result<Idx<Trapezoid<V, Index>>, InternalError> {
+        match self.filter_dividers(direction) {
+            Zot::Zero => Ok(if direction == DividerDirection::Ascending { self.ti_upleft } else { self.ti_downleft }),
+            Zot::One(div_r)  |
+            Zot::Two(_, div_r) => {
+                // If this nexus is a 'V' or 'A', the trapezoid can't be in the center trapezoid, 
+                // so we only need to check against the right segment
+
+                if direction == DividerDirection::Descending {
+                    mem::swap(&mut c_from, &mut c_to);
+                }
+
+                let ti = if is_left_of_line(c_from, c_to, self.c) {
+                    div_r.ti_right
+                } else {
+                    if direction == DividerDirection::Ascending { 
+                        self.ti_upleft 
+                    } else { 
+                        self.ti_downleft 
+                    } 
+                };
+                Ok(ti)
+            }
+        }
+    }
+
+    pub fn get_trapezoid_toward_coords(&self, ss: &[Segment<V, Index>], ns: &[Nexus<V, Index>], direction: DividerDirection, c_to: Coords<V::Coordinate>) -> Result<Idx<Trapezoid<V, Index>>, InternalError> {
+        match self.filter_dividers(direction) {
+            Zot::Zero => Ok(if direction == DividerDirection::Ascending { self.ti_upleft } else { self.ti_downleft }),
+            Zot::One(div) => {
+                let s = &ss[div.si];
+                
+                let ti = if is_left_of_line(ns[s.ni_min()].coords(), ns[s.ni_max()].coords(), c_to) {
+                    match direction {
+                        DividerDirection::Ascending => self.ti_upleft,
+                        DividerDirection::Descending => self.ti_downleft,
+                    }
+                } else {
+                    div.ti_right
+                };
+                
+                Ok(ti)
+            }
+            Zot::Two(_, _) => Err(InternalError::new("Nexus with fewer than 2 dividers expected")),
         }
     }
 }

@@ -1,12 +1,10 @@
-use crate::{builders, Triangulate};
-
-use super::util::VTest;
+use crate::{formats, Polygon, PolygonList};
 
 #[test]
 #[should_panic]
 fn incomplete_polygon() {
-    let polygon: Vec<VTest> = vec![(0., 0.).into(), (1., 1.).into()];
-    polygon.triangulate::<builders::VecVecFanBuilder<_>>(&mut Vec::new()).unwrap();
+    let polygon: Vec<[f32; 2]> = vec![[0., 0.], [1., 1.]];
+    polygon.triangulate(formats::IndexedFanFormat::new(&mut Vec::<Vec<_>>::new())).unwrap();
 }
 
 #[test]
@@ -17,8 +15,8 @@ fn overlapping_vertex() {
     //  x
     // / \
     // ---
-    let polygon: Vec<VTest> = vec![(-1., 1.).into(), (1., 1.).into(), (0., 0.).into(), (1., -1.).into(), (-1., -1.).into(), (0., 0.).into()];
-    polygon.triangulate::<builders::VecVecFanBuilder<_>>(&mut Vec::new()).unwrap();
+    let polygon: Vec<[f32; 2]> = vec![[-1., 1.], [1., 1.], [0., 0.], [1., -1.], [-1., -1.], [0., 0.]];
+    polygon.triangulate(formats::IndexedFanFormat::new(&mut Vec::<Vec<_>>::new())).unwrap();
 }
 
 #[test]
@@ -29,7 +27,7 @@ fn overlapping_polygons() {
     // |    | | |
     // |    +---+
     // +------+
-    let polygon_a: Vec<VTest> = vec![(0., 0.).into(), (0., 1.).into(), (1., 1.).into(), (1., 0.).into()];
-    let polygon_b: Vec<VTest> = vec![(0.75, 0.25).into(), (0.75, 0.75).into(), (1.25, 0.75).into(), (1.25, 0.25).into()];
-    vec![polygon_a, polygon_b].triangulate::<builders::VecVecFanBuilder<_>>(&mut Vec::new()).unwrap();
+    let polygon_a: Vec<[f32; 2]> = vec![[0., 0.], [0., 1.], [1., 1.], [1., 0.]];
+    let polygon_b: Vec<[f32; 2]> = vec![[0.75, 0.25], [0.75, 0.75], [1.25, 0.75], [1.25, 0.25]];
+    vec![polygon_a, polygon_b].triangulate(formats::IndexedFanFormat::new(&mut Vec::<Vec<_>>::new())).unwrap();
 }

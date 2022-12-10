@@ -1,6 +1,8 @@
-mod polygon;
-pub use polygon::{PolygonList, Triangulate, TriangulateDefault, PolygonVertex, IndexWithU16, IndexWithU16U16, IndexWithU32, IndexWithU32U32, IndexWithIter};
-pub(crate) use polygon::PolygonListExt;
+mod polygon_list;
+pub use polygon_list::{Polygon, PolygonList, PolygonElement, IndexWith, IndexWithIter};
+pub(crate) use polygon_list::PolygonListExt;
 mod vertex;
-pub use vertex::{Vertex, VertexIndex};
-pub(crate) use vertex::VertexExt;
+pub use vertex::Vertex;
+pub(crate) use vertex::{VertexExt, Coords};
+mod vertex_index;
+pub use vertex_index::VertexIndex;

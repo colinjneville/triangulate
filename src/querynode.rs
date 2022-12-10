@@ -1,13 +1,17 @@
-use crate::{Vertex, VertexIndex, idx::{Idx, IdxDisplay}, nexus::Nexus, segment::Segment, trapezoid::Trapezoid};
+use core::fmt;
+use std::clone;
+
+use num_traits::real::Real;
+
+use crate::{Vertex, VertexIndex, idx::{Idx, IdxDisplay}, trapezoid::Trapezoid, Coords};
 
 #[derive(Debug)]
 pub(crate) enum QueryNode<V: Vertex, Index: VertexIndex> {
-    Branch(Idx<QueryNode<V, Index>>, Idx<QueryNode<V, Index>>, QueryNodeBranch<V, Index>),
+    Branch(Idx<QueryNode<V, Index>>, Idx<QueryNode<V, Index>>, QueryNodeBranch<V::Coordinate>),
     Sink(Idx<Trapezoid<V, Index>>),
 }
 
-// https://github.com/rust-lang/rust/issues/26925
-impl<V: Vertex, Index: VertexIndex> std::clone::Clone for QueryNode<V, Index> {
+impl<V: Vertex, Index: VertexIndex> clone::Clone for QueryNode<V, Index> {
     fn clone(&self) -> Self {
         match self {
             Self::Branch(a, b, c) => Self::Branch(*a, *b, c.clone()),
@@ -16,8 +20,8 @@ impl<V: Vertex, Index: VertexIndex> std::clone::Clone for QueryNode<V, Index> {
     }
 }
 
-impl<V: Vertex, Index: VertexIndex> std::fmt::Display for QueryNode<V, Index> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<V: Vertex, Index: VertexIndex> fmt::Display for QueryNode<V, Index> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Branch(_, _, branch) => write!(f, "{}", branch),
             Self::Sink(ti) => write!(f, "S({})", ti),
@@ -25,27 +29,34 @@ impl<V: Vertex, Index: VertexIndex> std::fmt::Display for QueryNode<V, Index> {
     }
 }
 
-#[derive(Debug)]
-pub(crate) enum QueryNodeBranch<V: Vertex, Index: VertexIndex> {
-    X(Idx<Segment<V, Index>>),
-    Y(Idx<Nexus<V, Index>>),
+pub(crate) enum QueryNodeBranch<C: Real> {
+    X(Coords<C>, Coords<C>),
+    Y(Coords<C>),
 }
 
-// https://github.com/rust-lang/rust/issues/26925
-impl<V: Vertex, Index: VertexIndex> std::clone::Clone for QueryNodeBranch<V, Index> {
-    fn clone(&self) -> Self {
+impl<C: Real> fmt::Debug for QueryNodeBranch<C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::X(a) => Self::X(*a),
-            Self::Y(a) => Self::Y(*a),
+            Self::X(c_min_x, c_max_x) => f.debug_tuple("X").field(c_min_x).field(c_max_x).finish(),
+            Self::Y(c_y) => f.debug_tuple("Y").field(c_y).finish(),
         }
     }
 }
 
-impl<V: Vertex, Index: VertexIndex> std::fmt::Display for QueryNodeBranch<V, Index> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<C: Real> clone::Clone for QueryNodeBranch<C> {
+    fn clone(&self) -> Self {
         match self {
-            Self::X(si_x) => write!(f, "X({})", si_x),
-            Self::Y(ni_y) => write!(f, "Y({})", ni_y),
+            Self::X(c_min, c_max) => Self::X(*c_min, *c_max),
+            Self::Y(c) => Self::Y(*c),
+        }
+    }
+}
+
+impl<C: Real> fmt::Display for QueryNodeBranch<C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::X(c_min_x, c_max_x) => write!(f, "X({}, {})", c_min_x, c_max_x),
+            Self::Y(c_y) => write!(f, "Y({})", c_y),
         }
     }
 }
@@ -53,7 +64,7 @@ impl<V: Vertex, Index: VertexIndex> std::fmt::Display for QueryNodeBranch<V, Ind
 pub struct IndexedQueryNode<'a, V: Vertex, Index: VertexIndex>(Idx<QueryNode<V, Index>>, &'a QueryNode<V, Index>);
 
 impl<V: Vertex, Index: VertexIndex> QueryNode<V, Index> {
-    #[cfg(feature = "debugging")]
+    #[cfg(feature = "_debugging")]
     pub fn as_text_tree<'a>(&'a self, qi: Idx<Self>, qs: &'a [Self]) -> text_trees::TreeNode<IndexedQueryNode<'a, V, Index>> {
         let node = IndexedQueryNode(qi, self.into());
         match self {
@@ -81,22 +92,22 @@ impl<V: Vertex, Index: VertexIndex> QueryNode<V, Index> {
     }
 
     #[must_use]
-    pub fn into_x(&mut self, qi_left: Idx<Self>, qi_right: Idx<Self>, si_x: Idx<Segment<V, Index>>, ti_right: Idx<Trapezoid<V, Index>>) -> (Self, Self) {
-        (self.into_branch(qi_left, qi_right, QueryNodeBranch::X(si_x)), QueryNode::Sink(ti_right))
+    pub fn branch_x(&mut self, qi_left: Idx<Self>, qi_right: Idx<Self>, c_min_x: Coords<V::Coordinate>, c_max_x: Coords<V::Coordinate>, ti_right: Idx<Trapezoid<V, Index>>) -> (Self, Self) {
+        (self.branch(qi_left, qi_right, QueryNodeBranch::X(c_min_x, c_max_x)), QueryNode::Sink(ti_right))
     }
 
     #[must_use]
-    pub fn into_x_merge(&mut self, qi_left: Idx<Self>, qi_right: Idx<Self>, si_x: Idx<Segment<V, Index>>) -> Self {
-        self.into_branch(qi_left, qi_right, QueryNodeBranch::X(si_x))
+    pub fn merge_x(&mut self, qi_left: Idx<Self>, qi_right: Idx<Self>, c_min_x: Coords<V::Coordinate>, c_max_x: Coords<V::Coordinate>) -> Self {
+        self.branch(qi_left, qi_right, QueryNodeBranch::X(c_min_x, c_max_x))
     }
 
     #[must_use]
-    pub fn into_y(&mut self, qi_left: Idx<Self>, qi_right: Idx<Self>, ni_y: Idx<Nexus<V, Index>>, ti_up: Idx<Trapezoid<V, Index>>) -> (Self, Self) {
-        (self.into_branch(qi_left, qi_right, QueryNodeBranch::Y(ni_y)), QueryNode::Sink(ti_up))
+    pub fn branch_y(&mut self, qi_left: Idx<Self>, qi_right: Idx<Self>, c_y: Coords<V::Coordinate>, ti_up: Idx<Trapezoid<V, Index>>) -> (Self, Self) {
+        (self.branch(qi_left, qi_right, QueryNodeBranch::Y(c_y)), QueryNode::Sink(ti_up))
     }
 
     #[must_use]
-    fn into_branch(&mut self, qi_left: Idx<Self>, qi_right: Idx<Self>, branch: QueryNodeBranch<V, Index>) -> Self {
+    fn branch(&mut self, qi_left: Idx<Self>, qi_right: Idx<Self>, branch: QueryNodeBranch<V::Coordinate>) -> Self {
         let mut new = QueryNode::Branch(qi_left, qi_right, branch);
         std::mem::swap(self, &mut new);
         new

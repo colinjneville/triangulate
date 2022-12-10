@@ -1,18 +1,18 @@
-use std::{error, iter};
+use std::iter;
 
 use rand::prelude::SliceRandom;
 use zot::Ot;
-use crate::{FanBuilder, FanBuilderState, PolygonList, PolygonListExt, PolygonVertex, Vertex, VertexIndex, errors::{TriangulationError, TriangulationInternalError}, idx::{Idx, VecExt, SliceExt}, math::math_n, monotone::MonotoneBuilder, nexus::{FinalNexusType, Nexus}, querynode::{QueryNode, QueryNodeBranch}, segment::Segment, trapezoid::Trapezoid};
+use crate::{FanFormat, FanBuilderState, PolygonList, PolygonListExt, PolygonElement, Vertex, VertexIndex, errors::{TriangulationError, InternalError, TrapezoidationError}, idx::{Idx, VecExt, SliceExt}, math::{math_n, is_left_of_line}, monotone::MonotoneBuilder, nexus::{FinalNexusType, Nexus, DividerDirection}, querynode::{QueryNode, QueryNodeBranch}, segment::Segment, trapezoid::Trapezoid, Coords, FanBuilder};
 
-#[cfg(feature = "debugging")]
-use std::{marker, fmt};
-#[cfg(feature = "debugging")]
+#[cfg(feature = "_debugging")]
+use std::fmt;
+#[cfg(feature = "_debugging")]
 use crate::{debug, monotone::Monotone, VertexExt};
-#[cfg(feature = "debugging")]
+#[cfg(feature = "_debugging")]
 use num_traits::ToPrimitive;
 
-trait TrapezoidationStructure<'a, P: PolygonList<'a>> {
-    fn ps(&self) -> PolygonListExt<'a, P>;
+trait TrapezoidationStructure<'p, P: PolygonList<'p> + ?Sized + 'p> {
+    fn ps(&self) -> PolygonListExt<'p, P>;
     fn ns(&self) -> &[Nexus<P::Vertex, P::Index>];
     fn ss(&self) -> &[Segment<P::Vertex, P::Index>];
     fn ts(&self) -> &[Trapezoid<P::Vertex, P::Index>];
@@ -22,20 +22,26 @@ trait TrapezoidationStructure<'a, P: PolygonList<'a>> {
         Idx::new(0)
     }
 
-    fn find_trapezoid(&self, vi: P::Index) -> (Idx<QueryNode<P::Vertex, P::Index>>, Idx<Trapezoid<P::Vertex, P::Index>>) {
-        self.find_trapezoid_from_root(vi, self.query_node_root())
+    fn find_trapezoid(&self, c: Coords<<P::Vertex as Vertex>::Coordinate>) -> (Idx<QueryNode<P::Vertex, P::Index>>, Idx<Trapezoid<P::Vertex, P::Index>>) {
+        self.find_trapezoid_from_root(c, self.query_node_root())
     }
 
-    fn find_trapezoid_from_root(&self, vi: P::Index, qi_root: Idx<QueryNode<P::Vertex, P::Index>>) -> (Idx<QueryNode<P::Vertex, P::Index>>, Idx<Trapezoid<P::Vertex, P::Index>>) {
+    #[inline(never)]
+    fn find_trapezoid_from_root(&self, c: Coords<<P::Vertex as Vertex>::Coordinate>, qi_root: Idx<QueryNode<P::Vertex, P::Index>>) -> (Idx<QueryNode<P::Vertex, P::Index>>, Idx<Trapezoid<P::Vertex, P::Index>>) {
         let mut qi = qi_root;
         loop {
-            match &self.qs()[qi] {
+            // unsafe: `qs` is append-only and `Idx`s are never modified, so they will always remain valid within the same trapezoidation
+            match unsafe { self.qs().get_unchecked(qi.usize()) } {
                 QueryNode::Branch(left, right, branch) => {
-                    let use_left = match branch {
+                    let use_left = match *branch {
                         // The right trapezoid will be chosen if the vertex is one of the edge's endpoints
-                        QueryNodeBranch::X(si) => self.ss()[*si].is_on_left(self.ps(), self.ns(), vi.clone()),
+                        QueryNodeBranch::X(c_min_x, c_max_x) => is_left_of_line(c_min_x, c_max_x, c),
                         // Choose the lower trapezoid if this corresponds to an existing vertex (to make horizontal splitting easier)
-                        QueryNodeBranch::Y(ni_y) => self.ps()[vi.clone()] <= self.ps()[self.ns()[*ni_y].vertex()],
+                        QueryNodeBranch::Y(c_y) => { //self.ps()[vi.clone()] <= self.ps()[self.ns()[*ni_y].vertex()],
+                            let left = c;
+                            let right = c_y;
+                            left <= right
+                        }
                     };
                     qi = if use_left { *left } else { *right };
                 },
@@ -45,8 +51,8 @@ trait TrapezoidationStructure<'a, P: PolygonList<'a>> {
     }
 }
 
-#[cfg(feature = "debugging")]
-fn trapezoidation_fmt<'a, P: PolygonList<'a>, T: TrapezoidationStructure<'a, P>>(w: &mut impl std::io::Write, trapezoidation: &T) -> std::io::Result<()> {
+#[cfg(feature = "_debugging")]
+fn trapezoidation_fmt<'p, P: PolygonList<'p> + ?Sized, T: TrapezoidationStructure<'p, P>>(w: &mut impl std::io::Write, trapezoidation: &T) -> std::io::Result<()> {
     writeln!(w, "nexuses:")?;
     for (i, n) in trapezoidation.ns().iter().enumerate() {
         writeln!(w, "{}:", Idx::<Nexus<P::Vertex, P::Index>>::new(i))?;
@@ -74,69 +80,52 @@ fn trapezoidation_fmt<'a, P: PolygonList<'a>, T: TrapezoidationStructure<'a, P>>
     Ok(())
 }
 
-enum QueryNodeOrNexus<V: Vertex, Index: VertexIndex> {
-    QueryNode(Index, Idx<QueryNode<V, Index>>),
-    Nexus(Idx<Nexus<V, Index>>),
+#[derive(Debug)]
+enum VertexLocation<V: Vertex, Index: VertexIndex> {
+    Pending(Coords<V::Coordinate>, Index, Idx<QueryNode<V, Index>>),
+    Inserted(Coords<V::Coordinate>, Idx<Nexus<V, Index>>),
 }
 
-impl<V: Vertex, Index: VertexIndex> Clone for QueryNodeOrNexus<V, Index> {
+impl<V: Vertex, Index: VertexIndex> VertexLocation<V, Index> {
+    pub fn coords(&self) -> Coords<V::Coordinate> {
+        match self {
+            VertexLocation::Pending(c, _, _) => *c,
+            VertexLocation::Inserted(c, _) => *c,
+        }
+    }
+}
+
+impl<V: Vertex, Index: VertexIndex> Clone for VertexLocation<V, Index> {
     fn clone(&self) -> Self {
         match self {
-            QueryNodeOrNexus::QueryNode(index, qi) => QueryNodeOrNexus::QueryNode(index.clone(), *qi),
-            QueryNodeOrNexus::Nexus(ni) => QueryNodeOrNexus::Nexus(*ni),
+            Self::Pending(arg0, arg1, arg2) => Self::Pending(*arg0, arg1.clone(), *arg2),
+            Self::Inserted(arg0, arg1) => Self::Inserted(*arg0, *arg1),
         }
     }
 }
 
-pub(crate) struct TrapezoidationState<'a, P: PolygonList<'a>> {
-    ps: PolygonListExt<'a, P>,
-    ns: Vec<Nexus<P::Vertex, P::Index>>,
-    ss: Vec<Segment<P::Vertex, P::Index>>,
-    ts: Vec<Trapezoid<P::Vertex, P::Index>>,
-    qs: Vec<QueryNode<P::Vertex, P::Index>>,
-    #[cfg(feature = "debugging")]
+#[cfg(feature = "_debugging")]
+#[derive(Debug)]
+struct DebugInfo {
     svg_context: Option<debug::svg::SvgContext>,
-    #[cfg(feature = "debugging")]
     current_step: u32,
-    #[cfg(feature = "debugging")]
     current_substep: u32,
+    find_steps: usize,
 }
 
-impl<'a, P: PolygonList<'a>> TrapezoidationState<'a, P> {
-    pub fn new(ps: PolygonListExt<'a, P>) -> Self {
-        let vertex_count = ps.vertex_count();
-
-        // TODO What is the upper bound for number of query nodes?
-        // Just allocate a large amount for now
-        let mut qs = Vec::with_capacity(vertex_count * 4);
-        let ti = Idx::new(0);
-        let q = QueryNode::root(ti);
-        let qi = qs.push_get_index(q);
-        let t = Trapezoid::all(qi);
-
-        let mut ts = Vec::with_capacity(vertex_count * 2 + 1);
-        ts.push(t);
-
-        #[cfg(feature = "debugging")]
-        let svg_context = Self::svg_context(&ps);
-
+#[cfg(feature = "_debugging")]
+impl DebugInfo {
+    pub fn new<'p, P: PolygonList<'p> + ?Sized>(ps: &PolygonListExt<'p, P>) -> Self {
+        let svg_context = Self::svg_context(ps);
         Self {
-            ps,
-            ns: Vec::with_capacity(vertex_count),
-            ss: Vec::with_capacity(vertex_count),
-            ts,
-            qs,
-            #[cfg(feature = "debugging")]
             svg_context,
-            #[cfg(feature = "debugging")]
             current_step: 0,
-            #[cfg(feature = "debugging")]
             current_substep: 0,
+            find_steps: 0,
         }
     }
 
-    #[cfg(feature = "debugging")]
-    fn svg_context(ps: &PolygonListExt<'a, P>) -> Option<debug::svg::SvgContext> {
+    fn svg_context<'p, P: PolygonList<'p> + ?Sized>(ps: &PolygonListExt<'p, P>) -> Option<debug::svg::SvgContext> {
         let output_path = debug::env::svg::output_path()?;
         let output_level = debug::env::svg::output_level();
         let show_labels = debug::env::svg::show_labels();
@@ -153,8 +142,8 @@ impl<'a, P: PolygonList<'a>> TrapezoidationState<'a, P> {
         let mut view_y_min = max_value;
         let mut view_y_max = min_value;
         for index in ps.iter_polygon_vertices() {
-            let index: PolygonVertex<_> = index.into();
-            if let PolygonVertex::ContinuePolygon(index) = index {
+            let index: PolygonElement<_> = index.into();
+            if let PolygonElement::ContinuePolygon(index) = index {
                 let v = &ps[index];
                 view_x_min = view_x_min.min(v.x().to_f32().unwrap());
                 view_x_max = view_x_max.max(v.x().to_f32().unwrap());
@@ -181,14 +170,57 @@ impl<'a, P: PolygonList<'a>> TrapezoidationState<'a, P> {
             show_labels,
         })
     }
+}
 
-    #[cfg(feature = "debugging")]
-    fn output_svg(&mut self, style: debug::svg::SvgTriangulationStyle<'a, P::Vertex, P::Index>, level: debug::svg::SvgOutputLevel) {
-        if let Some(svg_context) = &self.svg_context {
+pub(crate) struct TrapezoidationState<'p, P: PolygonList<'p> + ?Sized> {
+    ps: PolygonListExt<'p, P>,
+    ns: Vec<Nexus<P::Vertex, P::Index>>,
+    ss: Vec<Segment<P::Vertex, P::Index>>,
+    ts: Vec<Trapezoid<P::Vertex, P::Index>>,
+    qs: Vec<QueryNode<P::Vertex, P::Index>>,
+    #[cfg(feature = "_debugging")]
+    debug_info: DebugInfo,
+}
+
+impl<'p, P: PolygonList<'p> + ?Sized> TrapezoidationState<'p, P> {
+    pub fn new(ps: &'p P) -> Self {
+        let ps = PolygonListExt::new(ps);
+        let vertex_count = ps.vertex_count();
+
+        // TODO What is the upper bound for number of query nodes?
+        // Just allocate a large amount for now
+        let mut qs = Vec::with_capacity(vertex_count * 4);
+        let ti = Idx::new(0);
+        let q = QueryNode::root(ti);
+        let qi = qs.push_get_index(q);
+        let t = Trapezoid::all(qi);
+
+        let mut ts = Vec::with_capacity(vertex_count * 2 + 1);
+        ts.push(t);
+
+        #[cfg(feature = "_debugging")]
+        let debug_info = DebugInfo::new(&ps);
+
+        Self {
+            ps,
+            ns: Vec::with_capacity(vertex_count),
+            ss: Vec::with_capacity(vertex_count),
+            ts,
+            qs,
+            #[cfg(feature = "_debugging")]
+            debug_info,
+        }
+    }
+
+    
+
+    #[cfg(feature = "_debugging")]
+    fn output_svg(&mut self, style: debug::svg::SvgTriangulationStyle<'p, P::Vertex, P::Index>, level: debug::svg::SvgOutputLevel) {
+        if let Some(svg_context) = &self.debug_info.svg_context {
             if svg_context.output_level >= level {
                 // Make the directory for this step if this is the first svg
-                if self.current_substep == 0 {
-                    let path = svg_context.output_path.join(format!("{:03}", self.current_step));
+                if self.debug_info.current_substep == 0 {
+                    let path = svg_context.output_path.join(format!("{:03}", self.debug_info.current_step));
                     if std::fs::create_dir(path).is_err() {
                         return;
                     }
@@ -197,53 +229,54 @@ impl<'a, P: PolygonList<'a>> TrapezoidationState<'a, P> {
                 let mut svg = debug::svg::SvgOutput::new(&svg_context, style);
                 let _ = svg.append_element(self, &());
                 
-                let path: std::path::PathBuf = format!("{:03}", self.current_step).into();
-                let path = path.join(format!("{:03}.svg", self.current_substep));
+                let path: std::path::PathBuf = format!("{:03}", self.debug_info.current_step).into();
+                let path = path.join(format!("{:03}.svg", self.debug_info.current_substep));
                 let _ = svg.save(path);
 
-                self.current_substep += 1;
+                self.debug_info.current_substep += 1;
             }
         }
     }
 
-    #[cfg(feature = "debugging")]
+    #[cfg(feature = "_debugging")]
     fn advance_step(&mut self) {
-        if let Some(svg_context) = &self.svg_context {
+        if let Some(svg_context) = &self.debug_info.svg_context {
             if svg_context.output_level >= debug::svg::SvgOutputLevel::MajorSteps {
-                let path = svg_context.output_path.join(format!("{:03}", self.current_step)).join("state.txt");
+                let path = svg_context.output_path.join(format!("{:03}", self.debug_info.current_step)).join("state.txt");
                 if let Ok(f) = std::fs::File::create(path) {
                     let mut w = std::io::BufWriter::new(&f);
                     let _ = trapezoidation_fmt(&mut w, self);
                 }
 
-                self.current_step += 1;
-                self.current_substep = 0;
+                self.debug_info.current_step += 1;
+                self.debug_info.current_substep = 0;
             }
         }
     }
 
-    pub fn build<FBError: error::Error>(mut self) -> Result<Trapezoidation<'a, P>, TriangulationError<FBError>> {
+    pub fn build(mut self) -> Result<Trapezoidation<'p, P>, TrapezoidationError> {
         // Track the best-known location of each vertex. Initially, all we have is the root QueryNode.
         // Periodically, for each uninserted vertex, we search for the trapezoid that contains the point and update the QueryNode.
         // Finally, once a vertex is inserted, we replace the QueryNode with the exact Nexus we created for the vertex
 
         // Allocate as if there is a single polygon (ensuring no reallocations)
-        let mut q_lookup: Vec<QueryNodeOrNexus<P::Vertex, P::Index>> = Vec::with_capacity(self.ps.vertex_count());
+        let mut v_lookup: Vec<VertexLocation<P::Vertex, P::Index>> = Vec::with_capacity(self.ps.vertex_count());
 
         // Ensure the iteration ends with NewPolygon
-        for polygon_vertex in self.ps.iter_polygon_vertices().map(Into::into).chain(iter::once(PolygonVertex::NewPolygon)) {
+        for polygon_vertex in self.ps.clone().iter_polygon_vertices().map(Into::into).chain(iter::once(PolygonElement::NewPolygon)) {
             match polygon_vertex {
-                PolygonVertex::ContinuePolygon(index) => {
-                    q_lookup.push(QueryNodeOrNexus::QueryNode(index, self.query_node_root()));
+                PolygonElement::ContinuePolygon(index) => {
+                    let c = self.ps[index.clone()].coords();
+                    v_lookup.push(VertexLocation::Pending(c, index, self.query_node_root()));
                 }
-                PolygonVertex::NewPolygon => {
-                    let v_count = q_lookup.len();
+                PolygonElement::NewPolygon => {
+                    let v_count = v_lookup.len();
                     if v_count > 0 {
                         if v_count < 3 {
-                            return Err(TriangulationError::NotEnoughVertices(v_count));
+                            return Err(TrapezoidationError::NotEnoughVertices(v_count));
                         } else {
-                            self.add_polygon(q_lookup.as_mut_slice()).map_err(TriangulationError::InternalError)?;
-                            q_lookup.clear();
+                            self.add_polygon(v_lookup.as_mut_slice()).map_err(TrapezoidationError::InternalError)?;
+                            v_lookup.clear();
                         }
                     }
                 }
@@ -253,97 +286,171 @@ impl<'a, P: PolygonList<'a>> TrapezoidationState<'a, P> {
         Ok(Trapezoidation::new(self))
     }
 
-    fn add_polygon(&mut self, q_lookup: &mut [QueryNodeOrNexus<P::Vertex, P::Index>]) -> Result<(), TriangulationInternalError> {
-        fn add_nth_segment<'a, P: PolygonList<'a>>(state: &mut TrapezoidationState<'a, P>, qons: &mut [QueryNodeOrNexus<P::Vertex, P::Index>], si: usize) -> Result<(), TriangulationInternalError> {
-            fn add_vertex<'a, P: PolygonList<'a>>(state: &mut TrapezoidationState<'a, P>, qon: &mut QueryNodeOrNexus<P::Vertex, P::Index>, index: P::Index, qi: Idx<QueryNode<P::Vertex, P::Index>>) -> Result<Idx<Nexus<P::Vertex, P::Index>>, TriangulationInternalError> {
+    #[inline(never)]
+    fn add_polygon(&mut self, vls: &mut [VertexLocation<P::Vertex, P::Index>]) -> Result<(), InternalError> {
+        #[inline(never)]
+        fn add_nth_segment<'p, P: PolygonList<'p> + ?Sized>(state: &mut TrapezoidationState<'p, P>, vls: &mut [VertexLocation<P::Vertex, P::Index>], si: usize) -> Result<usize, InternalError> {
+            #[inline(never)]
+            fn add_vertex<'p, P: PolygonList<'p> + ?Sized>(state: &mut TrapezoidationState<'p, P>, vl: &mut VertexLocation<P::Vertex, P::Index>, index: P::Index, qi: Idx<QueryNode<P::Vertex, P::Index>>) -> Result<Idx<Nexus<P::Vertex, P::Index>>, InternalError> {
                 let ni = state.add_vertex(index, qi)?;
 
-                #[cfg(feature = "debugging")]
+                #[cfg(feature = "_debugging")]
                 state.output_svg(debug::svg::SvgTriangulationStyle::highlight_nexus(ni), debug::svg::SvgOutputLevel::AllSteps);
                 
-                *qon = QueryNodeOrNexus::Nexus(ni);
+                *vl = VertexLocation::Inserted(vl.coords(), ni);
                 Ok(ni)
             }
 
-            let qoni0 = si;
-            let qoni1 = (si + 1) % qons.len();
-            let qon0 = qons[qoni0].clone();
-            let qon1 = qons[qoni1].clone();
+            let vli0 = si;
+            let vli1 = (si + 1) % vls.len();
+            let vl0 = vls[vli0].clone();
+            let vl1 = vls[vli1].clone();
 
-            let (ni0, ni1) = match (qon0, qon1) {
-                (QueryNodeOrNexus::QueryNode(index0, qi0), QueryNodeOrNexus::QueryNode(index1, qi1)) => {
-                    if state.ps[index0.clone()] < state.ps[index1.clone()] {
-                        let ni0 = add_vertex(state, &mut qons[qoni0], index0, qi0)?;
-                        let ni1 = add_vertex(state, &mut qons[qoni1], index1, qi1)?;
-                        (ni0, ni1)
+            let (ni0, ni1, added_vertices) = match (vl0, vl1) {
+                (VertexLocation::Pending(c0, index0, qi0), VertexLocation::Pending(c1, index1, qi1)) => {
+                    if c0 < c1 {
+                        let ni0 = add_vertex(state, &mut vls[vli0], index0, qi0)?;
+                        let ni1 = add_vertex(state, &mut vls[vli1], index1, qi1)?;
+                        (ni0, ni1, 2)
                     } else {
-                        let ni1 = add_vertex(state, &mut qons[qoni1], index1, qi1)?;
-                        let ni0 = add_vertex(state, &mut qons[qoni0], index0, qi0)?;
-                        (ni0, ni1)
+                        let ni1 = add_vertex(state, &mut vls[vli1], index1, qi1)?;
+                        let ni0 = add_vertex(state, &mut vls[vli0], index0, qi0)?;
+                        (ni0, ni1, 2)
                     }
                 }
-                (QueryNodeOrNexus::QueryNode(index0, qi0), QueryNodeOrNexus::Nexus(ni1)) => {
-                    let ni0 = add_vertex(state, &mut qons[qoni0], index0, qi0)?;
-                    (ni0, ni1)
+                (VertexLocation::Pending(_, index0, qi0), VertexLocation::Inserted(_, ni1)) => {
+                    let ni0 = add_vertex(state, &mut vls[vli0], index0, qi0)?;
+                    (ni0, ni1, 1)
                 }
-                (QueryNodeOrNexus::Nexus(ni0), QueryNodeOrNexus::QueryNode(index1, qi1)) => {
-                    let ni1 = add_vertex(state, &mut qons[qoni1], index1, qi1)?;
-                    (ni0, ni1)
+                (VertexLocation::Inserted(_, ni0), VertexLocation::Pending(_, index1, qi1)) => {
+                    let ni1 = add_vertex(state, &mut vls[vli1], index1, qi1)?;
+                    (ni0, ni1, 1)
                 }
-                (QueryNodeOrNexus::Nexus(ni0), QueryNodeOrNexus::Nexus(ni1)) => (ni0, ni1),
+                (VertexLocation::Inserted(_, ni0), VertexLocation::Inserted(_, ni1)) => (ni0, ni1, 0),
             };
             
-            let (ni_min, ni_max) = if state.ps[state.ns[ni0].vertex()] < state.ps[state.ns[ni1].vertex()] {
-                (ni0, ni1)
+            let c0 = state.ns[ni0].coords();
+            let c1 = state.ns[ni1].coords();
+
+            let (ni_min, ni_max, c_min, c_max) = if c0 < c1 {
+                (ni0, ni1, c0, c1)
             } else {
-                (ni1, ni0)
+                (ni1, ni0, c1, c0)
             };
 
-            state.add_segment(ni_min, ni_max)?;
+            state.add_segment(ni_min, ni_max, c_min, c_max)?;
 
-            #[cfg(feature = "debugging")]
+            #[cfg(feature = "_debugging")]
             state.advance_step();
 
-            Ok(())
+            Ok(added_vertices)
         }
 
+        let len = vls.len();
+
+        let mut pending_vertices = len;
+
         // Random insertion order of the segments avoids constant worst-case scenarios
-        let mut segment_order: Vec<_> = (0..q_lookup.len()).collect();
+        let mut segment_order: Vec<_> = (0..len).collect();
         segment_order[..].shuffle(&mut rand::thread_rng());
 
         // Periodically, at a decreasing rate, find the trapezoid each uninserted vertex is contained within, based on the current query structure
         // The next search can begin from that query node
         let mut update_count = 1;
-        let mut next_update = math_n(q_lookup.len(), update_count);
+        let mut next_update = math_n(len, update_count);
 
         for (i, vi0) in segment_order.into_iter().enumerate() {
-            add_nth_segment(self, &mut q_lookup[..], vi0)?;
+            pending_vertices -= add_nth_segment(self, &mut vls[..], vi0)?;
+
             if i == next_update {
-                for qnon in q_lookup.iter_mut() {
-                    if let QueryNodeOrNexus::QueryNode(index, qi) = qnon {
-                        let (qi_new, _) = self.find_trapezoid_from_root(index.clone(), *qi);
-                        *qnon = QueryNodeOrNexus::QueryNode(index.clone(), qi_new);
+                enum Location<N, T> {
+                    Nexus(N),
+                    Trapezoid(T),
+                }
+
+                fn reached_containing_trapezoid<V: Vertex, Index: VertexIndex>(ns: &[Nexus<V, Index>], t: &Trapezoid<V, Index>, direction: DividerDirection, c: Coords<V::Coordinate>) -> bool {
+                    match direction {
+                        DividerDirection::Ascending => t.up(),
+                        DividerDirection::Descending => t.down(),
+                    }.map(|ni| {
+                        let c_far = ns[ni].coords();
+                        match direction {
+                            DividerDirection::Ascending => c_far > c,
+                            DividerDirection::Descending => c_far < c,
+                        }
+                    }).unwrap_or(true)
+                }
+
+                let mut unlocated_pending_vertices = pending_vertices;
+
+                let mut vli_target = vi0;
+
+                // Dummy value, will be overwritten on first loop iteration
+                let mut location = Location::Nexus(Idx::new(0));
+
+                let mut c_origin = Coords::zero();
+
+                // Trace the edges of the polygon sequentially, recording the Trapezoid 
+                // the uninserted Vertices currently reside within
+                // We can stop early if the only remaining vertices are ones that have already been inserted
+                while unlocated_pending_vertices != 0 {
+                    vli_target = (vli_target + 1) % len;
+                    let vl_target = &vls[vli_target];
+                    match *vl_target {
+                        // First iteration will always be Inserted
+                        VertexLocation::Inserted(_, ni) => {
+                            // Inserted vertices already have a known location
+                            // Just set location to the nexus
+                            location = Location::Nexus(ni);
+                            c_origin = self.ns[ni].coords();
+                        }
+                        VertexLocation::Pending(c_target, ref index, _) => {
+                            let ascending = c_target > c_origin;
+                            let direction = if ascending { DividerDirection::Ascending } else { DividerDirection::Descending };
+
+                            // If on an inserted vertex, move to an adjacent Trapezoid toward the target
+                            let mut ti = match location {
+                                Location::Nexus(ni) => self.ns[ni].get_trapezoid_toward_coords(&self.ss, &self.ns, direction, c_target)?,
+                                Location::Trapezoid(ti) => ti,
+                            };
+
+                            while !reached_containing_trapezoid(&self.ns, &self.ts[ti], direction, c_target) {
+                                let t = &self.ts[ti];
+                                let ni = if direction == DividerDirection::Ascending { t.up() } else { t.down() };
+                                let ni = ni.ok_or_else(|| InternalError::new(format!("Trapezoid containing {c_target} (from {c_origin}) not found")))?;
+                                ti = self.ns[ni].get_trapezoid_between_coords(direction, c_origin, c_target)?;
+                            }
+
+                            unlocated_pending_vertices -= 1;
+                            let qi_target = self.ts[ti].sink();
+                            vls[vli_target] = VertexLocation::Pending(c_target, index.clone(), qi_target);
+                            location = Location::Trapezoid(ti);
+                            c_origin = c_target;
+                        }
                     }
                 }
 
                 update_count += 1;
-                next_update = math_n(q_lookup.len(), update_count);
+                next_update = math_n(len, update_count);
             }
         }
 
         Ok(())
     }
 
-    fn add_vertex(&mut self, vi: P::Index, qi_root: Idx<QueryNode<P::Vertex, P::Index>>) -> Result<Idx<Nexus<P::Vertex, P::Index>>, TriangulationInternalError> {
-        let (qi_parent, ti) = self.find_trapezoid_from_root(vi.clone(), qi_root);
+    #[inline(never)]
+    fn add_vertex(&mut self, vi: P::Index, qi_root: Idx<QueryNode<P::Vertex, P::Index>>) -> Result<Idx<Nexus<P::Vertex, P::Index>>, InternalError> {
+        let c = self.ps[vi.clone()].coords();
+        let (qi_parent, ti) = self.find_trapezoid_from_root(c, qi_root);
         let ti_new = self.ts.next_index();
 
         let qi_down = self.qs.next_index();
         let qi_up = qi_down + 1;
 
-        let ni = self.ns.push_get_index(Nexus::new(vi, ti_new, ti));
+        let c = self.ps[vi.clone()].coords();
+        let ni = self.ns.push_get_index(Nexus::new(vi, c, ti_new, ti));
 
-        let (q_left, q_right) = self.qs[qi_parent].into_y(qi_down, qi_up, ni, ti_new);
+        let (q_left, q_right) = self.qs[qi_parent].branch_y(qi_down, qi_up, c, ti_new);
         self.ts[ti].set_sink(qi_down);
         self.qs.push(q_left);
         self.qs.push(q_right);
@@ -362,17 +469,17 @@ impl<'a, P: PolygonList<'a>> TrapezoidationState<'a, P> {
         Ok(ni)
     }
 
-    pub fn add_segment(&mut self, ni_min: Idx<Nexus<P::Vertex, P::Index>>, ni_max: Idx<Nexus<P::Vertex, P::Index>>) -> Result<(), TriangulationInternalError> {
-        let si = self.ss.push_get_index(Segment::new(ni_min, ni_max));
+    pub fn add_segment(&mut self, ni_min: Idx<Nexus<P::Vertex, P::Index>>, ni_max: Idx<Nexus<P::Vertex, P::Index>>, c_min: Coords<<P::Vertex as Vertex>::Coordinate>, c_max: Coords<<P::Vertex as Vertex>::Coordinate>) -> Result<(), InternalError> {
+        let si = self.ss.push_get_index(Segment::new(ni_min, ni_max, c_min, c_max));
 
-        let ti = self.ns[ni_max].get_down_trapezoid_in_direction(self.ps, &self.ns, &self.ss, &self.ss[si])?;
+        let ti = self.ns[ni_max].get_down_trapezoid_in_direction( &self.ns, &self.ss, &self.ss[si])?;
 
         // Each segment adds one additional trapezoid
         let qi = self.ts[ti].sink();
         let ti_new = self.ts.next_index();
         let qi_left = self.qs.next_index();
         let qi_right = qi_left + 1;
-        let (q_left, q_right) = self.qs[qi].into_x(qi_left, qi_right, si, ti_new);
+        let (q_left, q_right) = self.qs[qi].branch_x(qi_left, qi_right, c_min, c_max, ti_new);
         self.ts[ti].set_sink(qi_left);
         self.qs.push(q_left);
         self.qs.push(q_right);
@@ -380,14 +487,15 @@ impl<'a, P: PolygonList<'a>> TrapezoidationState<'a, P> {
         let t_new = self.ts[ti].split_vertical(qi_left, qi_right, si);
         self.ts.push(t_new);
 
-        Nexus::add_segment(&mut self.ns, self.ps, &self.ss, ni_max, si, ti_new)?;
+        Nexus::add_segment(&mut self.ns, &self.ss, ni_max, si, ti_new)?;
 
-        #[cfg(feature = "debugging")]
+        #[cfg(feature = "_debugging")]
         self.output_svg(debug::svg::SvgTriangulationStyle::highlight_segment(si), debug::svg::SvgOutputLevel::AllSteps);
 
         let t= &self.ts[ti];
-        let mut ni = t.down().ok_or_else(|| TriangulationInternalError::new(format!("Segment min nexus not found at {}", ti)))?;
-        if ni != ni_min && !self.ss[si].is_on_left(self.ps, &self.ns, self.ns[ni].vertex()) {
+        let mut ni = t.down().ok_or_else(|| InternalError::new(format!("Segment min nexus not found at {}", ti)))?;
+        let n = &self.ns[ni];
+        if ni != ni_min && !self.ss[si].is_on_left(n.coords()) {
             let n = &mut self.ns[ni];
             n.replace_trapezoid(ti, ti_new)?;
         }
@@ -396,9 +504,9 @@ impl<'a, P: PolygonList<'a>> TrapezoidationState<'a, P> {
         let mut ti_upright = ti_new;
 
         while ni != ni_min {
-            let ti = self.ns[ni].get_down_trapezoid_in_direction(self.ps, &self.ns, &self.ss, &self.ss[si])?;
+            let ti = self.ns[ni].get_down_trapezoid_in_direction(&self.ns, &self.ss, &self.ss[si])?;
 
-            ni = self.ts[ti].down().ok_or_else(|| TriangulationInternalError::new(format!("Segment min nexus not found at {}", ti)))?;
+            ni = self.ts[ti].down().ok_or_else(|| InternalError::new(format!("Segment min nexus not found at {}", ti)))?;
             
             let t = &self.ts[ti];
             let t_upleft = &self.ts[ti_upleft];
@@ -407,41 +515,41 @@ impl<'a, P: PolygonList<'a>> TrapezoidationState<'a, P> {
 
             if t.right() == t_upright.right() {
                 let qi_left = self.qs.next_index();
-                let q_left = self.qs[qi_sink].into_x_merge(qi_left, t_upright.sink(), si);
+                let q_left = self.qs[qi_sink].merge_x(qi_left, t_upright.sink(), c_min, c_max);
                 self.ts[ti].set_sink(qi_left);
                 self.qs.push(q_left);
                 self.ts[ti].set_right(si);
                 self.ts[ti_upright].set_down(ni);
                 
-                if ni != ni_min && !self.ss[si].is_on_left(self.ps, &self.ns, self.ns[ni].vertex()) {
+                if ni != ni_min && !self.ss[si].is_on_left(self.ns[ni].coords()) {
                     self.ns[ni].replace_trapezoid(ti, ti_upright)?;
                 }
                 ti_upleft = ti;
                 // ti_upright remains the same
             } else if t.left() == t_upleft.left() {
                 let qi_right = self.qs.next_index();
-                let q_right = self.qs[qi_sink].into_x_merge(t_upleft.sink(), qi_right, si);
+                let q_right = self.qs[qi_sink].merge_x(t_upleft.sink(), qi_right, c_min, c_max);
                 self.ts[ti].set_sink(qi_right);
                 self.qs.push(q_right);
                 self.ts[ti].set_left(si);
                 self.ts[ti_upleft].set_down(ni);
                 
-                if ni == ni_min || self.ss[si].is_on_left(self.ps, &self.ns, self.ns[ni].vertex()) {
+                if ni == ni_min || self.ss[si].is_on_left(self.ns[ni].coords()) {
                     self.ns[ni].replace_trapezoid(ti, ti_upleft)?;
                 }
                 ti_upright = ti;
                 // ti_upleft remains the same
             } else {
-                return Err(TriangulationInternalError::new(format!("No matching side segment during split - ti: {}, ti_upleft: {}, ti_upright: {}, t.left: {:?}, t.right: {:?}, t_upleft.left: {:?}, t_upright.right: {:?}", ti, ti_upleft, ti_upright, t.left(), t.right(), t_upleft.left(), t_upright.right())));
+                return Err(InternalError::new(format!("No matching side segment during split - ti: {}, ti_upleft: {}, ti_upright: {}, t.left: {:?}, t.right: {:?}, t_upleft.left: {:?}, t_upright.right: {:?}", ti, ti_upleft, ti_upright, t.left(), t.right(), t_upleft.left(), t_upright.right())));
             }
 
-            #[cfg(feature = "debugging")]
+            #[cfg(feature = "_debugging")]
             self.output_svg(debug::svg::SvgTriangulationStyle::highlight_nexus(ni), debug::svg::SvgOutputLevel::AllSteps);
         }
 
-        Nexus::add_segment(&mut self.ns, self.ps, &self.ss, ni_min, si, ti_upright)?;
+        Nexus::add_segment(&mut self.ns, &self.ss, ni_min, si, ti_upright)?;
 
-        #[cfg(feature = "debugging")]
+        #[cfg(feature = "_debugging")]
         self.output_svg(debug::svg::SvgTriangulationStyle::highlight_segment(si), debug::svg::SvgOutputLevel::MajorSteps);
 
         self.check_consistency();
@@ -527,8 +635,8 @@ impl<'a, P: PolygonList<'a>> TrapezoidationState<'a, P> {
     }
 }
 
-impl<'a, P: PolygonList<'a>> TrapezoidationStructure<'a, P> for TrapezoidationState<'a, P> {
-    fn ps(&self) -> PolygonListExt<'a, P> { self.ps }
+impl<'t, 'p: 't, P: PolygonList<'p> + ?Sized> TrapezoidationStructure<'p, P> for TrapezoidationState<'p, P> {
+    fn ps(&self) -> PolygonListExt<'p, P> { self.ps }
 
     fn ns(&self) -> &[Nexus<P::Vertex, P::Index>] { &self.ns }
 
@@ -539,31 +647,32 @@ impl<'a, P: PolygonList<'a>> TrapezoidationStructure<'a, P> for TrapezoidationSt
     fn qs(&self) -> &[QueryNode<P::Vertex, P::Index>] { &self.qs }
 }
 
-pub(crate) struct Trapezoidation<'a, P: PolygonList<'a>> {
-    ps: PolygonListExt<'a, P>,
-    ns: Vec<Nexus<P::Vertex, P::Index>>,
-    ss: Vec<Segment<P::Vertex, P::Index>>,
-    ts: Vec<Trapezoid<P::Vertex, P::Index>>,
-    qs: Vec<QueryNode<P::Vertex, P::Index>>,
+/// The trapezoidation of a [PolygonList] generated as the first step of triangulation.
+pub struct Trapezoidation<'p, P: PolygonList<'p> + ?Sized> {
+    ps: PolygonListExt<'p, P>,
+    ns: Box<[Nexus<P::Vertex, P::Index>]>,
+    ss: Box<[Segment<P::Vertex, P::Index>]>,
+    ts: Box<[Trapezoid<P::Vertex, P::Index>]>,
+    qs: Box<[QueryNode<P::Vertex, P::Index>]>,
 }
 
-impl<'a, P: PolygonList<'a>> Trapezoidation<'a, P> {
-    fn new(state: TrapezoidationState<'a, P>) -> Self {
-        Self {
-            ps: state.ps,
-            ns: state.ns,
-            ss: state.ss,
-            ts: state.ts,
-            qs: state.qs,
-        }
+impl<'p, P: PolygonList<'p> + ?Sized> Trapezoidation<'p, P> {
+    fn new(state: TrapezoidationState<'p, P>) -> Self {
+        let TrapezoidationState { ps, ns, ss, ts, qs, .. } = state;
+        let ns = ns.into_boxed_slice();
+        let ss = ss.into_boxed_slice();
+        let ts = ts.into_boxed_slice();
+        let qs = qs.into_boxed_slice();
+
+        Self { ps, ns, ss, ts, qs }
     }
 
-    pub fn top_trapezoid(&self) -> Result<Idx<Trapezoid<P::Vertex, P::Index>>, TriangulationInternalError> {
+    fn top_trapezoid(&self) -> Result<Idx<Trapezoid<P::Vertex, P::Index>>, InternalError> {
         let mut qi = Idx::<QueryNode<P::Vertex, P::Index>>::new(0);
         loop {
             match &self.qs[qi] {
                 QueryNode::Branch(_, right, kind) => match kind {
-                    QueryNodeBranch::X(_) => return Err(TriangulationInternalError::new("Finding the top trapezoid should not reach an X node")),
+                    QueryNodeBranch::X(_, _) => return Err(InternalError::new("Finding the top trapezoid should not reach an X node")),
                     QueryNodeBranch::Y(_) => qi = *right, // Always take the 'above' branch
                 },
                 QueryNode::Sink(ti) => return Ok(*ti),
@@ -571,22 +680,22 @@ impl<'a, P: PolygonList<'a>> Trapezoidation<'a, P> {
         }
     }
 
-    fn triangulate_inner<FB: FanBuilder<'a, P>>(&self, fbs: &mut FanBuilderState<'a, P, FB>) -> Result<(), TriangulationError<FB::Error>> {
+    fn triangulate_inner<FB: FanFormat<'p, P>>(&self, fbs: &mut FanBuilderState<'p, P, FB>) -> Result<(), TriangulationError<<FB::Builder as FanBuilder<'p, P>>::Error>> {
         struct State<V: Vertex, Index: VertexIndex> {
             ti: Idx<Trapezoid<V, Index>>,
-            monotones: Option<Ot<MonotoneBuilder<Index>>>,
+            monotones: Option<Ot<MonotoneBuilder<Index, V::Coordinate>>>,
         }
         impl<V: Vertex, Index: VertexIndex> State<V, Index> {
-            pub fn new(ti: Idx<Trapezoid<V, Index>>, monotones: Option<Ot<MonotoneBuilder<Index>>>) -> Self {
+            pub fn new(ti: Idx<Trapezoid<V, Index>>, monotones: Option<Ot<MonotoneBuilder<Index, V::Coordinate>>>) -> Self {
                 Self { ti, monotones }
             }
         }
 
         const INNER_POLYGON_ERROR: &str = "A trapezoid inside the polygon must be enclosed";
 
-        let mut ti = self.top_trapezoid().map_err(|e| TriangulationError::InternalError(e))?;
-        // If the current trapezoid is inside the polygon, fans is Some, outside it is None
-        let mut monotones = Option::<Ot<MonotoneBuilder<P::Index>>>::None;
+        let mut ti = self.top_trapezoid().map_err(TriangulationError::InternalError)?;
+        // If the current trapezoid is inside the polygon, monotones is Some, outside it is None
+        let mut monotones = Option::<Ot<MonotoneBuilder<P::Index, <P::Vertex as Vertex>::Coordinate>>>::None;
 
         // We will treat the graph of trapezoids as a tree and perform a depth-first traversal.
         // Whenever we reach an 'A' nexus, continue traversing the leftmost branch, but store the center
@@ -597,7 +706,7 @@ impl<'a, P: PolygonList<'a>> Trapezoidation<'a, P> {
         // the left trapezoid should push its monotone to this stack and yield.
         // Once the right trapezoid reaches this point, it will pop from this stack and combine with its current monotone
         // to have a Ot::Two monotone going down
-        let mut monotone_stack = Vec::<MonotoneBuilder<P::Index>>::new();
+        let mut monotone_stack = Vec::<MonotoneBuilder<P::Index, <P::Vertex as Vertex>::Coordinate>>::new();
         
         while let Some(ni_down) = self.ts[ti].down() {
             let t = &self.ts[ti];
@@ -606,7 +715,7 @@ impl<'a, P: PolygonList<'a>> Trapezoidation<'a, P> {
             if let Some(mut monotones_some) = monotones.take() {
                 // Add this nexus to all monotone chains
                 for monotone in monotones_some.iter_mut() {
-                    monotone.add_vertex(self.ps, n_down.vertex());
+                    monotone.add_vertex(n_down.vertex(), n_down.coords());
                 }
 
                 let s_left = match t.left() {
@@ -650,7 +759,7 @@ impl<'a, P: PolygonList<'a>> Trapezoidation<'a, P> {
                     } 
                 } {
                     // Triangulate the completed monotone
-                    match monotone_complete.build(self.ps) {
+                    match monotone_complete.build() {
                         Ok(monotone_complete) => {
                             if let Some(monotone_complete) = monotone_complete {
                                 monotone_complete.build_fans::<P, FB>(self.ps, fbs)?;
@@ -662,14 +771,16 @@ impl<'a, P: PolygonList<'a>> Trapezoidation<'a, P> {
                     // If that was the only monotone, we need to start a new one
                     if monotones.is_none() {
                         // Begin with the upper and lower nexuses' vertices
-                        let mut fan_new = MonotoneBuilder::new(self.ns[ni_up].vertex().clone());
-                        fan_new.add_vertex(self.ps, n_down.vertex());
-                        monotones = Some(fan_new.into());
+                        let vi = self.ns[ni_up].vertex().clone();
+                        let c = self.ps[vi.clone()].coords();
+                        let mut monotone_new = MonotoneBuilder::new(vi, c);
+                        monotone_new.add_vertex(n_down.vertex(), n_down.coords());
+                        monotones = Some(monotone_new.into());
                     }
                 }
             }
 
-            ti = match n_down.final_type().map_err(|e| TriangulationError::InternalError(e))? {
+            ti = match n_down.final_type().map_err(TriangulationError::InternalError)? {
                 FinalNexusType::V { ti_upleft, ti_upcenter, ti_upright, ti_down } => {
                     if let Some(monotones_some) = monotones.take() {
                         if ti == ti_upleft {
@@ -678,7 +789,7 @@ impl<'a, P: PolygonList<'a>> Trapezoidation<'a, P> {
                         } else if ti == ti_upcenter {
                             // Finish the monotone(s)
                             for monotone in monotones_some.into_iter() {
-                                match monotone.build(self.ps) {
+                                match monotone.build() {
                                     Ok(monotone) => {
                                         if let Some(monotone) = monotone {
                                             monotone.build_fans::<P, FB>(self.ps, fbs)?;
@@ -724,8 +835,9 @@ impl<'a, P: PolygonList<'a>> Trapezoidation<'a, P> {
                                 let ni_up = t.up().ok_or_else(|| TriangulationError::internal(INNER_POLYGON_ERROR))?;
 
                                 // Start a second monotone with the current and previous nexuses' vertices
-                                let mut monotone_new = MonotoneBuilder::new(self.ns[ni_up].vertex().clone());
-                                monotone_new.add_vertex(self.ps, n_down.vertex());
+                                let n = &self.ns[ni_up];
+                                let mut monotone_new = MonotoneBuilder::new(n.vertex(), n.coords());
+                                monotone_new.add_vertex(n_down.vertex(), n_down.coords());
 
                                 // Put the new monotone on the correct side
                                 if ni_up == self.ss[t.left().ok_or_else(|| TriangulationError::internal(INNER_POLYGON_ERROR))?].ni_max() {
@@ -747,7 +859,7 @@ impl<'a, P: PolygonList<'a>> Trapezoidation<'a, P> {
                         // The left and right trapezoids are still outside the polygon
                         branch_stack.push(State::new(ti_downright, None));
                         // Start a new monotone from the center trapezoid
-                        let monotone_new = MonotoneBuilder::new(n_down.vertex().clone());
+                        let monotone_new = MonotoneBuilder::new(n_down.vertex(), n_down.coords());
                         branch_stack.push(State::new(ti_downcenter, Some(monotone_new.into())));
                     }
                     ti_downleft
@@ -755,9 +867,9 @@ impl<'a, P: PolygonList<'a>> Trapezoidation<'a, P> {
             }
         }
 
-        if monotone_stack.len() > 0 {
+        if !monotone_stack.is_empty() {
             Err(TriangulationError::internal("Mismatched monotone stack"))
-        } else if branch_stack.len() > 0 {
+        } else if !branch_stack.is_empty() {
             Err(TriangulationError::internal("Mismatched branch stack"))
         } else if monotones.is_some() {
             Err(TriangulationError::internal("Unexpected partial monotones"))
@@ -766,28 +878,43 @@ impl<'a, P: PolygonList<'a>> Trapezoidation<'a, P> {
         }
     }
 
-    pub fn triangulate<FB: FanBuilder<'a, P>>(&self, initializer: FB::Initializer) -> Result<FB::Output, TriangulationError<FB::Error>> {
-        let mut fbs = FanBuilderState::<'a, P, FB>::Uninitialized(initializer);
+    /// Triangulate the trapezoidation.
+    /// 
+    /// See [PolygonList::triangulate].
+    pub fn triangulate<FB: FanFormat<'p, P>>(&self, format: FB) -> Result<<FB::Builder as FanBuilder<'p, P>>::Output, TriangulationError<<FB::Builder as FanBuilder<'p, P>>::Error>> {
+        let mut fbs = FanBuilderState::<'p, P, FB>::Uninitialized(format);
         // Separate out the actual triangulation logic, so FanBuilder error handling can be consolidated to one location
         let result = self.triangulate_inner(&mut fbs);
         fbs.complete(result)
     }
 }
 
-#[cfg(feature = "debugging")]
-impl<'a, P: PolygonList<'a>> debug::svg::SvgElement<debug::svg::SvgTriangulationStyle<'a, P::Vertex, P::Index>, ()> for TrapezoidationState<'a, P> {
-    fn write_svg<'b>(&self, svg_output: &mut debug::svg::SvgOutput<'b, debug::svg::SvgTriangulationStyle<'a, P::Vertex, P::Index>>, _state: &()) -> fmt::Result {
+impl<'p, P: PolygonList<'p> + ?Sized> TrapezoidationStructure<'p, P> for Trapezoidation<'p, P> {
+    fn ps(&self) -> PolygonListExt<'p, P> { self.ps }
+
+    fn ns(&self) -> &[Nexus<<P as PolygonList<'p>>::Vertex, <P as PolygonList<'p>>::Index>] { &self.ns }
+
+    fn ss(&self) -> &[Segment<<P as PolygonList<'p>>::Vertex, <P as PolygonList<'p>>::Index>] { &self.ss }
+
+    fn ts(&self) -> &[Trapezoid<<P as PolygonList<'p>>::Vertex, <P as PolygonList<'p>>::Index>] { &self.ts }
+
+    fn qs(&self) -> &[QueryNode<<P as PolygonList<'p>>::Vertex, <P as PolygonList<'p>>::Index>] { &self.qs }
+}
+
+#[cfg(feature = "_debugging")]
+impl<'p, P: PolygonList<'p> + ?Sized> debug::svg::SvgElement<debug::svg::SvgTriangulationStyle<'p, P::Vertex, P::Index>, ()> for TrapezoidationState<'p, P> {
+    fn write_svg<'b>(&self, svg_output: &mut debug::svg::SvgOutput<'b, debug::svg::SvgTriangulationStyle<'p, P::Vertex, P::Index>>, _state: &()) -> fmt::Result {
         use svg_fmt::*;
         use fmt::Write;
 
-        for pv in self.ps.iter_polygon_vertices().map(Into::into).chain(iter::once(PolygonVertex::NewPolygon)) {
+        for pv in self.ps.iter_polygon_vertices().map(Into::into).chain(iter::once(PolygonElement::NewPolygon)) {
             let mut vs = Vec::new();
             match pv {
-                PolygonVertex::ContinuePolygon(index) => {
+                PolygonElement::ContinuePolygon(index) => {
                     let v = &self.ps[index];
                     vs.push([v.x().to_f32().unwrap(), v.y().to_f32().unwrap()]);
                 }
-                PolygonVertex::NewPolygon => {
+                PolygonElement::NewPolygon => {
                     if vs.len() > 2 {
                         writeln!(svg_output, "{}", 
                             polygon(&vs)
@@ -798,8 +925,8 @@ impl<'a, P: PolygonList<'a>> debug::svg::SvgElement<debug::svg::SvgTriangulation
                 }
             }
         }
-        for pv in self.ps.iter_polygon_vertices().map(Into::<PolygonVertex<P::Index>>::into) {
-            if let PolygonVertex::ContinuePolygon(index) = pv {
+        for pv in self.ps.iter_polygon_vertices().map(Into::<PolygonElement<P::Index>>::into) {
+            if let PolygonElement::ContinuePolygon(index) = pv {
                 svg_output.append_element(&IndexWrap(index), self)?;
             }
         }
@@ -816,12 +943,12 @@ impl<'a, P: PolygonList<'a>> debug::svg::SvgElement<debug::svg::SvgTriangulation
     }
 }
 
-#[cfg(feature = "debugging")]
+#[cfg(feature = "_debugging")]
 struct IndexWrap<Index>(Index);
 
-#[cfg(feature = "debugging")]
-impl<'a, P: PolygonList<'a>> debug::svg::SvgElement<debug::svg::SvgTriangulationStyle<'a, P::Vertex, P::Index>, TrapezoidationState<'a, P>> for IndexWrap<P::Index> {
-    fn write_svg<'b>(&self, svg_output: &mut debug::svg::SvgOutput<'b, debug::svg::SvgTriangulationStyle<'a, P::Vertex, P::Index>>, state: &TrapezoidationState<'a, P>) -> std::fmt::Result {
+#[cfg(feature = "_debugging")]
+impl<'p, P: PolygonList<'p> + ?Sized> debug::svg::SvgElement<debug::svg::SvgTriangulationStyle<'p, P::Vertex, P::Index>, TrapezoidationState<'p, P>> for IndexWrap<P::Index> {
+    fn write_svg<'b>(&self, svg_output: &mut debug::svg::SvgOutput<'b, debug::svg::SvgTriangulationStyle<'p, P::Vertex, P::Index>>, state: &TrapezoidationState<'p, P>) -> std::fmt::Result {
         use svg_fmt::*;
         use fmt::Write;
 
@@ -843,7 +970,7 @@ impl<'a, P: PolygonList<'a>> debug::svg::SvgElement<debug::svg::SvgTriangulation
     }
 }
 
-#[cfg(feature = "debugging")]
+#[cfg(feature = "_debugging")]
 fn get_x_intercept<V: Vertex>(v_min: &VertexExt<V>, v_max: &VertexExt<V>, y: f32) -> f32 {
     let y_diff = (v_max.y() - v_min.y()).to_f32().unwrap();
     if y_diff != 0.0 {
@@ -854,9 +981,9 @@ fn get_x_intercept<V: Vertex>(v_min: &VertexExt<V>, v_max: &VertexExt<V>, y: f32
     }
 }
 
-#[cfg(feature = "debugging")]
-impl<'a, P: PolygonList<'a>> debug::svg::SvgElement<debug::svg::SvgTriangulationStyle<'a, P::Vertex, P::Index>, TrapezoidationState<'a, P>> for Idx<Nexus<P::Vertex, P::Index>> {
-    fn write_svg<'b>(&self, svg_output: &mut debug::svg::SvgOutput<'b, debug::svg::SvgTriangulationStyle<'a, P::Vertex, P::Index>>, state: &TrapezoidationState<'a, P>) -> fmt::Result {
+#[cfg(feature = "_debugging")]
+impl<'p, P: PolygonList<'p> + ?Sized> debug::svg::SvgElement<debug::svg::SvgTriangulationStyle<'p, P::Vertex, P::Index>, TrapezoidationState<'p, P>> for Idx<Nexus<P::Vertex, P::Index>> {
+    fn write_svg<'b>(&self, svg_output: &mut debug::svg::SvgOutput<'b, debug::svg::SvgTriangulationStyle<'p, P::Vertex, P::Index>>, state: &TrapezoidationState<'p, P>) -> fmt::Result {
         use svg_fmt::*;
         use fmt::Write;
 
@@ -914,9 +1041,9 @@ impl<'a, P: PolygonList<'a>> debug::svg::SvgElement<debug::svg::SvgTriangulation
     }
 }
 
-#[cfg(feature = "debugging")]
-impl<'a, P: PolygonList<'a>> debug::svg::SvgElement<debug::svg::SvgTriangulationStyle<'a, P::Vertex, P::Index>, TrapezoidationState<'a, P>> for Idx<Segment<P::Vertex, P::Index>> {
-    fn write_svg<'b>(&self, svg_output: &mut debug::svg::SvgOutput<'b, debug::svg::SvgTriangulationStyle<'a, P::Vertex, P::Index>>, state: &TrapezoidationState<'a, P>) -> fmt::Result {
+#[cfg(feature = "_debugging")]
+impl<'p, P: PolygonList<'p> + ?Sized> debug::svg::SvgElement<debug::svg::SvgTriangulationStyle<'p, P::Vertex, P::Index>, TrapezoidationState<'p, P>> for Idx<Segment<P::Vertex, P::Index>> {
+    fn write_svg<'b>(&self, svg_output: &mut debug::svg::SvgOutput<'b, debug::svg::SvgTriangulationStyle<'p, P::Vertex, P::Index>>, state: &TrapezoidationState<'p, P>) -> fmt::Result {
         use svg_fmt::*;
         use fmt::Write;
 
@@ -943,9 +1070,9 @@ impl<'a, P: PolygonList<'a>> debug::svg::SvgElement<debug::svg::SvgTriangulation
     }
 }
 
-#[cfg(feature = "debugging")]
-impl<'a, P: PolygonList<'a>> debug::svg::SvgElement<debug::svg::SvgTriangulationStyle<'a, P::Vertex, P::Index>, TrapezoidationState<'a, P>> for Idx<Trapezoid<P::Vertex, P::Index>> {
-    fn write_svg<'b>(&self, svg_output: &mut debug::svg::SvgOutput<'b, debug::svg::SvgTriangulationStyle<'a, P::Vertex, P::Index>>, state: &TrapezoidationState<'a, P>) -> fmt::Result {
+#[cfg(feature = "_debugging")]
+impl<'p, P: PolygonList<'p> + ?Sized> debug::svg::SvgElement<debug::svg::SvgTriangulationStyle<'p, P::Vertex, P::Index>, TrapezoidationState<'p, P>> for Idx<Trapezoid<P::Vertex, P::Index>> {
+    fn write_svg<'b>(&self, svg_output: &mut debug::svg::SvgOutput<'b, debug::svg::SvgTriangulationStyle<'p, P::Vertex, P::Index>>, state: &TrapezoidationState<'p, P>) -> fmt::Result {
         use svg_fmt::*;
         use fmt::Write;
 
@@ -1012,13 +1139,13 @@ impl<'a, P: PolygonList<'a>> debug::svg::SvgElement<debug::svg::SvgTriangulation
     }
 }
 
-#[cfg(feature = "debugging")]
-impl<'a, P: PolygonList<'a>> debug::svg::SvgElement<debug::svg::SvgTriangulationStyle<'a, P::Vertex, P::Index>, TrapezoidationState<'a, P>> for Monotone<P::Index> {
-    fn write_svg<'b>(&self, svg_output: &mut debug::svg::SvgOutput<'b, debug::svg::SvgTriangulationStyle<'a, P::Vertex, P::Index>>, state: &TrapezoidationState<'a, P>) -> fmt::Result {
+#[cfg(feature = "_debugging")]
+impl<'p, P: PolygonList<'p> + ?Sized> debug::svg::SvgElement<debug::svg::SvgTriangulationStyle<'p, P::Vertex, P::Index>, TrapezoidationState<'p, P>> for Monotone<P::Index, <P::Vertex as Vertex>::Coordinate> {
+    fn write_svg<'b>(&self, svg_output: &mut debug::svg::SvgOutput<'b, debug::svg::SvgTriangulationStyle<'p, P::Vertex, P::Index>>, state: &TrapezoidationState<'p, P>) -> fmt::Result {
         use svg_fmt::*;
         use fmt::Write;
 
-        let points: Vec<_> = self.skipped_and_pending.iter().map(|vi| &state.ps[vi.clone()]).map(|v| [v.x().to_f32().unwrap(), v.y().to_f32().unwrap()]).collect();
+        let points: Vec<_> = self.skipped_and_pending.iter().map(|(vi, _)| &state.ps[vi.clone()]).map(|v| [v.x().to_f32().unwrap(), v.y().to_f32().unwrap()]).collect();
         writeln!(svg_output, "{}",
             polygon(&points)
                 .open()
@@ -1029,24 +1156,24 @@ impl<'a, P: PolygonList<'a>> debug::svg::SvgElement<debug::svg::SvgTriangulation
     }
 }
 
-#[cfg(feature = "debugging")]
-struct PolygonSvgWrap<'a, P: PolygonList<'a>>(P, marker::PhantomData<&'a ()>);
+#[cfg(feature = "_debugging")]
+struct PolygonSvgWrap<'p, P: PolygonList<'p> + ?Sized>(PolygonListExt<'p, P>);
 
-#[cfg(feature = "debugging")]
-impl<'a, P: PolygonList<'a>> debug::svg::SvgElement<debug::svg::SvgTriangulationStyle<'a, P::Vertex, P::Index>> for PolygonSvgWrap<'a, P> {
-    fn write_svg<'b>(&self, svg_output: &mut debug::svg::SvgOutput<'b, debug::svg::SvgTriangulationStyle<'a, P::Vertex, P::Index>>, _state: &()) -> fmt::Result {
+#[cfg(feature = "_debugging")]
+impl<'p, P: PolygonList<'p> + ?Sized> debug::svg::SvgElement<debug::svg::SvgTriangulationStyle<'p, P::Vertex, P::Index>> for PolygonSvgWrap<'p, P> {
+    fn write_svg<'b>(&self, svg_output: &mut debug::svg::SvgOutput<'b, debug::svg::SvgTriangulationStyle<'p, P::Vertex, P::Index>>, _state: &()) -> fmt::Result {
         use svg_fmt::*;
         use fmt::Write;
 
         let mut points = Vec::new();
 
-        for vertex in self.0.iter_polygon_vertices() {
-            let vertex: PolygonVertex<_> = vertex.into();
+        for vertex in self.0.polygon_list().iter_indices() {
+            let vertex: PolygonElement<_> = vertex.into();
             match vertex {
-                PolygonVertex::ContinuePolygon(vertex) => {
-                    points.push([self.0.get_vertex(vertex.clone()).x().to_f32().unwrap(), self.0.get_vertex(vertex).y().to_f32().unwrap()]);
+                PolygonElement::ContinuePolygon(vertex) => {
+                    points.push([self.0.polygon_list().get_vertex(vertex.clone()).x().to_f32().unwrap(), self.0.polygon_list().get_vertex(vertex).y().to_f32().unwrap()]);
                 }
-                PolygonVertex::NewPolygon => {
+                PolygonElement::NewPolygon => {
                     writeln!(svg_output, "{}",
                         polygon(&points)
                             .stroke(Stroke::Color(black(), svg_output.context.percent(1.)))

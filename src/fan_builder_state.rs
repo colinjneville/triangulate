@@ -1,17 +1,17 @@
 use std::{fmt, mem};
 
-use crate::{FanBuilder, PolygonList, TriangulationError};
+use crate::{FanFormat, PolygonList, TriangulationError, FanBuilder};
 
 
-pub(crate) enum FanBuilderState<'a, P: PolygonList<'a>, FB: FanBuilder<'a, P>> {
-    Uninitialized(FB::Initializer),
-    Initialized(FB),
-    Error(Option<FB>),
+pub(crate) enum FanBuilderState<'p, P: PolygonList<'p> + ?Sized, FB: FanFormat<'p, P>> {
+    Uninitialized(FB),
+    Initialized(FB::Builder),
+    Error(Option<FB::Builder>),
 }
 
-impl<'a, P: PolygonList<'a>, FB: FanBuilder<'a, P>> FanBuilderState<'a, P, FB> {
-    pub(crate) fn new_fan(&mut self, polygon_list: P, vi0: P::Index, vi1: P::Index, vi2: P::Index) -> Result<&mut FB, TriangulationError<FB::Error>> {
-        fn set_initialized<'b, 'a, P: PolygonList<'a>, FB: FanBuilder<'a, P>>(s: &'b mut FanBuilderState<'a, P, FB>, fb: FB) -> Result<&'b mut FB, TriangulationError<FB::Error>> {
+impl<'p, P: PolygonList<'p> + ?Sized, FB: FanFormat<'p, P>> FanBuilderState<'p, P, FB> {
+    pub(crate) fn new_fan(&mut self, polygon_list: &'p P, vi0: P::Index, vi1: P::Index, vi2: P::Index) -> Result<&mut FB::Builder, TriangulationError<<FB::Builder as FanBuilder<'p, P>>::Error>> {
+        fn set_initialized<'f, 'pp, P: PolygonList<'pp> + ?Sized, FB: FanFormat<'pp, P>>(s: &'f mut FanBuilderState<'pp, P, FB>, fb: FB::Builder) -> Result<&'f mut FB::Builder, TriangulationError<<FB::Builder as FanBuilder<'pp, P>>::Error>> {
             *s = FanBuilderState::Initialized(fb);
             if let FanBuilderState::Initialized(fb) = s {
                 Ok(fb)
@@ -30,15 +30,15 @@ impl<'a, P: PolygonList<'a>, FB: FanBuilder<'a, P>> FanBuilderState<'a, P, FB> {
                     }
                 }
             }
-            Self::Uninitialized(initializer) => {
-                let fb = FB::new(initializer, polygon_list, vi0, vi1, vi2).map_err(TriangulationError::from)?;
+            Self::Uninitialized(fb) => {
+                let fb = fb.initialize(polygon_list, vi0, vi1, vi2).map_err(TriangulationError::from)?;
                 set_initialized(self, fb)
             }
             Self::Error(_) => Err(TriangulationError::internal("msg")),
         }
     }
 
-    pub(crate) fn complete(self, result: Result<(), TriangulationError<FB::Error>>) -> Result<FB::Output, TriangulationError<FB::Error>> {
+    pub(crate) fn complete(self, result: Result<(), TriangulationError<<FB::Builder as FanBuilder<'p, P>>::Error>>) -> Result<<FB::Builder as FanBuilder<'p, P>>::Output, TriangulationError<<FB::Builder as FanBuilder<'p, P>>::Error>> {
         match (self, result) {
             // Success
             (FanBuilderState::Initialized(fb), Ok(())) => fb.build().map_err(Into::into),
@@ -66,27 +66,7 @@ impl<'a, P: PolygonList<'a>, FB: FanBuilder<'a, P>> FanBuilderState<'a, P, FB> {
     }
 }
 
-impl<'a, P: PolygonList<'a>, FB: FanBuilder<'a, P>> From<FanBuilderState<'a, P, FB>> for Option<FB> {
-    fn from(fbs: FanBuilderState<'a, P, FB>) -> Self {
-        match fbs {
-            FanBuilderState::Uninitialized(_) => None,
-            FanBuilderState::Initialized(fb) => Some(fb),
-            FanBuilderState::Error(ofb) => ofb,
-        }
-    }
-}
-
-impl<'z, 'a, P: PolygonList<'a>, FB: FanBuilder<'a, P>> From<&'z mut FanBuilderState<'a, P, FB>> for Option<&'z mut FB> {
-    fn from(fbs: &'z mut FanBuilderState<'a, P, FB>) -> Self {
-        match fbs {
-            FanBuilderState::Uninitialized(_) => None,
-            FanBuilderState::Initialized(fb) => Some(fb),
-            FanBuilderState::Error(ofb) => ofb.as_mut(),
-        }
-    }
-}
-
-impl<'a, P: PolygonList<'a>, FB: FanBuilder<'a, P>> fmt::Debug for FanBuilderState<'a, P, FB> {
+impl<'a, P: PolygonList<'a> + ?Sized, FB: FanFormat<'a, P>> fmt::Debug for FanBuilderState<'a, P, FB> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             FanBuilderState::Uninitialized(_) => "FanBuilderState::Uninitialized",

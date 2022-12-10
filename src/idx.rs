@@ -1,6 +1,5 @@
-use std::{fmt, marker::PhantomData, num::NonZeroUsize};
+use std::{fmt, marker::PhantomData, num::NonZeroUsize, ops, cmp, hash};
 
-#[derive(Ord, PartialOrd, Hash)]
 #[repr(transparent)]
 pub struct Idx<T>(NonZeroUsize, PhantomData<T>);
 
@@ -11,11 +10,11 @@ impl<T> fmt::Debug for Idx<T> {
 }
 
 pub trait IdxDisplay {
-    fn fmt(f: &mut std::fmt::Formatter<'_>, idx: usize) -> std::fmt::Result;
+    fn fmt(f: &mut fmt::Formatter<'_>, idx: usize) -> fmt::Result;
 }
 
 impl<T: IdxDisplay> fmt::Display for Idx<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         T::fmt(f, self.usize())
     }
 }
@@ -27,26 +26,26 @@ impl<T> Idx<T> {
     }
 
     pub fn advance(&mut self) -> Self {
-        let curr = self.clone();
+        let curr = *self;
         *self = Self::new(self.usize() + 1);
         curr
     }
 
     pub fn advance_wrapped(&mut self, slice: &[T]) -> Self {
-        let curr = self.clone();
+        let curr = *self;
         *self = self.next_wrapped(slice);
         curr
     }
 
     pub fn next_wrapped(&self, slice: &[T]) -> Self {
-        if slice.len() == 0 {
+        if slice.is_empty() {
             panic!("slice must not be empty");
         }
         Self::new((self.usize() + 1) % slice.len())
     }
 
     pub fn recede(&mut self) -> Self {
-        let curr = self.clone();
+        let curr = *self;
         // Maybe just panic instead if already at 0?
         if self.usize() > 0 {
             *self = Self::new(self.usize() - 1);
@@ -55,13 +54,13 @@ impl<T> Idx<T> {
     }
 
     pub fn recede_wrapped(&mut self, slice: &[T]) -> Self {
-        let curr = self.clone();
+        let curr = *self;
         *self = self.prev_wrapped(slice);
         curr
     }
 
     pub fn prev_wrapped(&self, slice: &[T]) -> Self {
-        if slice.len() == 0 {
+        if slice.is_empty() {
             panic!("slice must not be empty");
         }
 
@@ -78,11 +77,11 @@ impl<T> Idx<T> {
     }
 }
 
-// #[derive(Copy, Clone)] does not work where type parameters are not copy/clone
+// #[derive] does not work where type parameters do not implement the trait
 // https://github.com/rust-lang/rust/issues/26925
 impl<T> Clone for Idx<T> {
     fn clone(&self) -> Self {
-        Self(self.0.clone(), Default::default())
+        Self(self.0, Default::default())
     }
 }
 
@@ -96,7 +95,7 @@ impl<T> PartialEq for Idx<T> {
 
 impl<T> Eq for Idx<T> { }
 
-impl<T> std::ops::Add for Idx<T> {
+impl<T> ops::Add for Idx<T> {
     type Output = Self;
 
     fn add(self, rhs: Self) -> Self::Output {
@@ -104,7 +103,7 @@ impl<T> std::ops::Add for Idx<T> {
     }
 }
 
-impl<T> std::ops::Add<usize> for Idx<T> {
+impl<T> ops::Add<usize> for Idx<T> {
     type Output = Self;
 
     fn add(self, rhs: usize) -> Self::Output {
@@ -112,7 +111,7 @@ impl<T> std::ops::Add<usize> for Idx<T> {
     }
 }
 
-impl<T> std::ops::Sub for Idx<T> {
+impl<T> ops::Sub for Idx<T> {
     type Output = Self;
 
     fn sub(self, rhs: Self) -> Self::Output {
@@ -120,7 +119,7 @@ impl<T> std::ops::Sub for Idx<T> {
     }
 }
 
-impl<T> std::ops::Sub<usize> for Idx<T> {
+impl<T> ops::Sub<usize> for Idx<T> {
     type Output = Self;
 
     fn sub(self, rhs: usize) -> Self::Output {
@@ -129,34 +128,55 @@ impl<T> std::ops::Sub<usize> for Idx<T> {
     }
 }
 
-impl<T> std::cmp::PartialEq<usize> for Idx<T> {
+impl<T> cmp::PartialEq<usize> for Idx<T> {
     fn eq(&self, other: &usize) -> bool {
         &self.usize() == other
     }
 }
 
-impl<T> std::cmp::PartialEq<Idx<T>> for usize {
+impl<T> cmp::PartialOrd for Idx<T> {
+    fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
+        self.0.partial_cmp(&other.0)
+    }
+}
+
+impl<T> cmp::Ord for Idx<T> {
+    fn cmp(&self, other: &Self) -> cmp::Ordering {
+        self.0.cmp(&other.0)
+    }
+}
+
+impl<T> hash::Hash for Idx<T> {
+    fn hash<H: hash::Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+    }
+}
+
+impl<T> cmp::PartialEq<Idx<T>> for usize {
     fn eq(&self, other: &Idx<T>) -> bool {
         self == &other.usize()
     }
 }
 
 
-impl<T> std::ops::Index<Idx<T>> for Vec<T> {
+impl<T> ops::Index<Idx<T>> for Vec<T> {
     type Output = T;
 
     fn index(&self, index: Idx<T>) -> &Self::Output {
-        &self[index.usize()]
+        unsafe {
+            self.get_unchecked(index.usize())
+        }
+        //&self[index.usize()]
     }
 }
 
-impl<T> std::ops::IndexMut<Idx<T>> for Vec<T> {
+impl<T> ops::IndexMut<Idx<T>> for Vec<T> {
     fn index_mut(&mut self, index: Idx<T>) -> &mut Self::Output {
         &mut self[index.usize()]
     }
 }
 
-impl<T> std::ops::Index<Idx<T>> for [T] {
+impl<T> ops::Index<Idx<T>> for [T] {
     type Output = T;
 
     fn index(&self, index: Idx<T>) -> &Self::Output {
@@ -164,7 +184,7 @@ impl<T> std::ops::Index<Idx<T>> for [T] {
     }
 }
 
-impl<T> std::ops::IndexMut<Idx<T>> for [T] {
+impl<T> ops::IndexMut<Idx<T>> for [T] {
     fn index_mut(&mut self, index: Idx<T>) -> &mut Self::Output {
         &mut self[index.usize()]
     }

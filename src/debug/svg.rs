@@ -137,6 +137,7 @@ impl<'a, V: 'a + Vertex, Index: 'a + VertexIndex> SvgTriangulationStyle<'a, V, I
     }
 }
 
+#[derive(Debug)]
 pub(crate) struct SvgContext {
     pub output_path: path::PathBuf,
     pub output_level: SvgOutputLevel,
