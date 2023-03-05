@@ -29,27 +29,13 @@ println!("First triangle: {:?}, {:?}, {:?}",
     polygons.get_vertex(triangulated_indices[2]));
 ```
 
-Any type that implements [Polygon] or [PolygonList] can be triangulated. Most commonly that would be [Vec<_>] or [Vec<Vec<_>>] (where `_`: [Vertex], such as `[f32; 2]`), 
+Any type that implements `Polygon` or `PolygonList` can be triangulated. Most commonly that would be `Vec<T>` or `Vec<Vec<T>>` (where `T`: `Vertex`, such as `[f32; 2]`), 
 but you can implement the trait on your own types.
 
-The output format is also customizable. [PolygonList::triangulate] takes a [FanFormat], which determines the resulting output. 
-Most commonly, you would want [formats::IndexedListFormat], which stores three indices for every generated triangle in a [List] (like [Vec]).
-However, this is a [ListFormat] (it takes individual triangles instead of triangle fans), so it must be converted to a [FanFormat] by calling [ListFormat::into_fan_format] (see the example above).
-Another useful format is [formats::DeindexedListFormat], which deindexes each triangle point to create a [List] of the actual vertices.
-
-## Input traits
-* [Vertex]
-* [VertexIndex]
-* [Polygon]
-* [PolygonList]
-## Output traits
-* [Fan]
-* [Fans]
-* [List]
-* [FanFormat]
-* [FanBuilder]
-* [ListFormat]
-* [ListBuilder]
+The output format is also customizable. `PolygonList::triangulate` takes a `FanFormat`, which determines the resulting output. 
+Most commonly, you would want `formats::IndexedListFormat`, which stores three indices for every generated triangle in a `List` (like `Vec`).
+However, this is a `ListFormat` (it takes individual triangles instead of triangle fans), so it must be converted to a `FanFormat` by calling `ListFormat::into_fan_format` (see the example above).
+Another useful format is `formats::DeindexedListFormat`, which deindexes each triangle point to create a `List` of the actual vertices.
 
 ## Preconditions  
 * No edge can cross any other edge, whether it is on the same polygon or not.
